@@ -10,8 +10,8 @@ const url = name => new URL(name, base).href;
 
 // Deterministic layout fixtures, not a browser renderer. Tests exercise the
 // public output against declared page positions, selection and clipping.
-function fixture({ scrollX = 0, scrollY = 0, resources = [] } = {}) {
-  const doc = { baseURI: base, ownerDocument: null };
+function fixture({ scrollX = 0, scrollY = 0, resources = [], documentURL = base, baseURI = base } = {}) {
+  const doc = { URL: documentURL, baseURI, ownerDocument: null };
   const style = (el, pseudo) => {
     if (el.styleError) throw new Error('unavailable style');
     const inherited = el.parentElement ? style(el.parentElement).visibility :
@@ -34,7 +34,7 @@ function fixture({ scrollX = 0, scrollY = 0, resources = [] } = {}) {
   function element(tag, options = {}) {
     const attrs = options.attrs || {};
     const el = {
-      localName: tag, ownerDocument: doc, baseURI: base, parentElement: null,
+      localName: tag, ownerDocument: doc, baseURI, parentElement: null,
       attrs, styles: options.styles || {}, pseudos: options.pseudos || {}, children: [],
       currentSrc: options.currentSrc ?? (['img', 'video'].includes(tag) ? attrs.src || '' : ''),
       type: attrs.type || '', src: attrs.src || '',
@@ -240,4 +240,67 @@ test('unavailable geometry keeps the media URL in the unplaced group', () => {
   assert.deepEqual(urls(grab), ['working.jpg', 'broken.jpg'].map(url));
   assert.equal(grab.rows[1].top, null);
   assert.deepEqual(visible(grab), [url('working.jpg')]);
+});
+
+test('CSS references to inline SVG masks are excluded, including absolute and escaped fragments', () => {
+  const f = fixture({ documentURL: `${base}#section` });
+  f.doc.body.append(f.element('div', {
+    attrs: { 'data-bg': 'url("#attributeMask")' },
+    styles: {
+      'mask-image': `url("${base}#_r_43_"), url("#localMask")`,
+      '-webkit-mask-image': 'url("\\23 escapedMask")',
+      'background-image': 'url("/real.jpg")'
+    },
+    pseudos: { '::before': { content: 'url("#pseudoMask")' } }
+  }));
+  const grab = f.run();
+  assert.deepEqual(urls(grab), [url('/real.jpg')]);
+  assert.deepEqual(visible(grab), [url('/real.jpg')]);
+});
+
+test('external SVG fragment URLs and data images remain collected', () => {
+  const f = fixture();
+  const embedded = 'data:image/svg+xml;base64,PHN2Zy8+';
+  f.doc.body.append(f.element('div', { styles: {
+    'mask-image': `url("/masks.svg#star"), url("https://cdn.example/mask.svg#shape"), url("${embedded}")`,
+    'background-image': `url("${base}?variant=2#shape")`
+  } }), f.img('/illustration.svg#view', 100));
+  assert.deepEqual(new Set(urls(f.run())), new Set([
+    url('/masks.svg#star'), 'https://cdn.example/mask.svg#shape', embedded,
+    `${base}?variant=2#shape`, url('/illustration.svg#view')
+  ]));
+});
+
+test('inline reference checks use the document URL even with a different base URI', () => {
+  const f = fixture({ baseURI: 'https://cdn.example/assets/' });
+  f.doc.body.append(f.element('div', { styles: {
+    'mask-image': `url("${base}#local"), url("#alsoLocal"), url("external.svg#star")`
+  } }));
+  assert.deepEqual(urls(f.run()), ['https://cdn.example/assets/external.svg#star']);
+});
+
+test('iframe CSS reference checks use the child document rather than the top page', () => {
+  const parentURL = 'https://shop.example/page.svg', childURL = 'https://shop.example/detail.svg';
+  const f = fixture({ documentURL: parentURL, baseURI: parentURL });
+  const child = fixture({ documentURL: childURL, baseURI: childURL });
+  child.doc.body.append(child.element('div', { styles: {
+    'mask-image': `url("${childURL}#local"), url("${parentURL}#external")`
+  } }));
+  const frame = f.element('iframe');
+  Object.assign(frame, { contentDocument: child.doc, clientWidth: 80, clientHeight: 80,
+    offsetWidth: 80, offsetHeight: 80 });
+  f.doc.body.append(frame);
+  assert.deepEqual(urls(f.run()), [`${parentURL}#external`]);
+});
+
+test('262 inline mask references do not inflate the count of 470 media URLs', () => {
+  const f = fixture();
+  const names = Array.from({ length: 470 }, (_, i) => `kept-${i}.jpg`);
+  for (let i = 0; i < 262; i++) f.doc.body.append(f.element('div', {
+    styles: { 'mask-image': `url("${base}#_r_${i}_")` }
+  }));
+  for (const [i, name] of names.entries()) f.doc.body.append(f.img(name, i * 100));
+  const grab = f.run();
+  assert.equal(grab.rows.length, 470);
+  assert.deepEqual(urls(grab), names.map(url));
 });

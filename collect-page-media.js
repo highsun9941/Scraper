@@ -109,7 +109,7 @@
       }
     }
   };
-  const css = (text, base, source, position, visible, element) => {
+  const css = (text, base, source, position, visible, element, documentURL = base) => {
     const re = /url\(\s*(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|([^)]*))\s*\)/gi;
     for (const m of String(text || "").matchAll(re)) {
       const raw = (m[1] ?? m[2] ?? m[3]).trim().replace(
@@ -120,7 +120,19 @@
           return String.fromCodePoint(cp > 0 && cp <= 0x10ffff && !(cp >= 0xd800 && cp <= 0xdfff) ? cp : 0xfffd);
         }
       );
-      add(raw, "IMAGE", base, source, position, visible, element);
+      // url(#id)는 페이지 안의 SVG 참조이며 별도 이미지 파일이 아닙니다.
+      // 계산된 CSS가 이를 문서의 절대 URL로 바꾼 경우도 제외합니다.
+      if (raw.startsWith("#")) continue;
+      const href = absolute(raw, base);
+      if (!href) continue;
+      try {
+        const target = new URL(href), page = new URL(documentURL);
+        if (target.hash) {
+          target.hash = ""; page.hash = "";
+          if (target.href === page.href) continue;
+        }
+      } catch {}
+      add(href, "IMAGE", base, source, position, visible, element);
     }
   };
   const walk = (root, seen, ctx) => {
@@ -128,6 +140,7 @@
     seen.add(root);
     const doc = root.ownerDocument || root, win = doc.defaultView;
     if (!win) return;
+    const documentURL = doc.URL || doc.location?.href || win.location?.href || doc.baseURI;
     if (!seen.has(win)) {
       seen.add(win);
       let resources = [];
@@ -172,7 +185,7 @@
       for (const a of ["data-bg", "data-background", "data-background-image", "data-image", "data-image-src", "data-video-src", "data-video-url", "data-poster"]) {
         const value = el.getAttribute(a);
         if (!value) continue;
-        if (/url\(/i.test(value)) css(value, base, a, position, false, element);
+        if (/url\(/i.test(value)) css(value, base, a, position, false, element, documentURL);
         else if (/^(?:https?:|blob:|data:|\/|\.{1,2}\/)/i.test(value) || guess(value)) {
           emit(value, a.includes("video") ? "VIDEO" : "IMAGE", a, false);
         }
@@ -184,7 +197,7 @@
           const painted = s.display !== "none" && !["hidden", "collapse"].includes(s.visibility) &&
             parseFloat(s.opacity) !== 0 && (!pseudo || !["none", "normal", ""].includes(s.content));
           for (const prop of ["background-image", "content", "border-image-source", "list-style-image", "mask-image", "-webkit-mask-image"]) {
-            css(s.getPropertyValue(prop), base, `css${pseudo || ""}.${prop}`, locate(el, ctx), painted, element);
+            css(s.getPropertyValue(prop), base, `css${pseudo || ""}.${prop}`, locate(el, ctx), painted, element, documentURL);
           }
         } catch {}
       }
