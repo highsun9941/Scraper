@@ -1,5 +1,5 @@
 (() => {
-  const found = new Map(), blockedFrames = new Set();
+  const found = new Map(), excluded = new Map(), blockedFrames = new Set();
   let styles, layouts, elementOrder;
   const guess = u => {
     if (/\.gif(?:$|[?#])|^data:image\/gif[;,]/i.test(u)) return "GIF";
@@ -70,6 +70,14 @@
       const u = new URL(href);
       if (!/^(?:https?:|blob:|data:)$/.test(u.protocol)) return;
       if (u.protocol === "data:" && !/^data:(?:image|video)\//i.test(href)) return;
+      // 확장자가 .gif여도 이벤트 수집용 엔드포인트는 미디어가 아닙니다.
+      // 알려진 정확한 주소만 제외해 일반 GIF와 영상 요청은 유지합니다.
+      if (u.hostname === "mercury.coupang.com" && u.pathname === "/e.gif") {
+        if (!excluded.has(href)) excluded.set(href, {
+          url: href, source, reason: "통계·이벤트 수집 주소 (Coupang Mercury)"
+        });
+        return;
+      }
       const type = guess(href) || kind;
       if (!type) return;
       let row = found.get(href);
@@ -246,6 +254,8 @@
     get urls() { return this.rows.map(r => r.url); },
     get visibleRows() { return this.rows.filter(r => r.visible); },
     get visibleUrls() { return this.visibleRows.map(r => r.url); },
+    get excludedRows() { return [...excluded.values()].map(r => ({ ...r })); },
+    get excludedUrls() { return [...excluded.keys()]; },
     get blockedFrames() { return [...blockedFrames]; },
     scan() {
       styles = new WeakMap(); layouts = new WeakMap(); elementOrder = 0;
@@ -261,6 +271,7 @@
       console.table(rows);
       console.log(`총 ${found.size}개 URL (페이지 좌표 순서, 위치 미확인 주소는 뒤쪽)\n${rows.map(r => r.url).join("\n")}`);
       console.log(`표시 요소의 선택 주소 ${this.visibleUrls.length}개: copy(mediaGrab.visibleUrls.join('\\n'))`);
+      if (excluded.size) console.log(`미디어에서 제외한 통계·이벤트 주소 ${excluded.size}개: mediaGrab.excludedRows`);
       if (blockedFrames.size) console.log("접근할 수 없는 iframe:", this.blockedFrames);
       return rows;
     }

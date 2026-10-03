@@ -304,3 +304,77 @@ test('262 inline mask references do not inflate the count of 470 media URLs', ()
   assert.equal(grab.rows.length, 470);
   assert.deepEqual(urls(grab), names.map(url));
 });
+
+test('67 Mercury event addresses are excluded while 392 images and the CSS spinner GIF remain', () => {
+  const trackers = Array.from({ length: 67 }, (_, i) => ({
+    name: `https://mercury.coupang.com/e.gif?t=101&r=test-${i}`,
+    initiatorType: ['beacon', 'fetch', 'xmlhttprequest', 'img'][i % 4]
+  }));
+  const f = fixture({ resources: trackers });
+  for (let i = 0; i < 392; i++) f.doc.body.append(f.img(`image-${i}.jpg`, i * 100));
+  const spinner = 'https://img1a.coupangcdn.com/image/sdp/spinner.gif';
+  f.doc.body.append(f.element('div', { styles: {
+    display: 'none', 'background-image': `url("${spinner}")`
+  } }));
+  const grab = f.run();
+  assert.equal(grab.rows.length, 393);
+  assert.deepEqual(Array.from(grab.rows.filter(row => row.type === 'GIF'), row => row.url), [spinner]);
+  assert.equal(grab.excludedRows.length, 67);
+  assert.deepEqual(new Set(Array.from(grab.excludedUrls)), new Set(trackers.map(row => row.name)));
+  assert.ok(grab.excludedRows.every(row => row.reason && row.source === 'network'));
+});
+
+test('ordinary GIFs fetched through fetch or XHR remain in the network collection', () => {
+  const f = fixture({ resources: [
+    { name: url('/animation.gif'), initiatorType: 'fetch' },
+    { name: url('/another.gif?size=large'), initiatorType: 'xmlhttprequest' }
+  ] });
+  const grab = f.run();
+  assert.deepEqual(urls(grab), [url('/animation.gif'), url('/another.gif?size=large')]);
+  assert.ok(grab.rows.every(row => row.type === 'GIF'));
+  assert.equal(grab.excludedRows.length, 0);
+});
+
+test('exclusion is limited to the exact Mercury host and e.gif endpoint', () => {
+  const keep = [
+    'https://mercury.coupang.com/gallery/animation.gif',
+    'https://mercury.coupang.com/other/e.gif',
+    'https://cdn.example/e.gif',
+    'https://mercury.coupang.com.evil.example/e.gif',
+    'https://mercury.coupang.com@cdn.example/e.gif'
+  ];
+  const omit = ['http://mercury.coupang.com/e.gif?r=test',
+    'https://MERCURY.COUPANG.COM/e.gif?t=101&r=test'];
+  const f = fixture({ resources: [...keep, ...omit].map(name => ({ name, initiatorType: 'img' })) });
+  const grab = f.run();
+  assert.deepEqual(urls(grab), keep.map(url));
+  assert.deepEqual(Array.from(grab.excludedUrls), omit.map(url));
+});
+
+test('Mercury event addresses found in DOM or CSS are excluded and diagnostics are deduplicated', () => {
+  const event = 'https://mercury.coupang.com/e.gif?r=test';
+  const f = fixture();
+  f.doc.body.append(f.img(event, 10),
+    f.element('div', { styles: { 'background-image': `url("${event}")` } }),
+    f.element('a', { attrs: { href: event } }), f.img('/actual.gif', 100));
+  const grab = f.run();
+  assert.deepEqual(urls(grab), [url('/actual.gif')]);
+  assert.deepEqual(visible(grab), [url('/actual.gif')]);
+  assert.equal(grab.excludedRows.length, 1);
+  const diagnostic = grab.excludedRows[0];
+  diagnostic.reason = 'changed by caller';
+  assert.notEqual(grab.excludedRows[0].reason, 'changed by caller');
+});
+
+test('scan preserves unique excluded address history and never adds it to the media results', () => {
+  const events = [{ name: 'https://mercury.coupang.com/e.gif?r=first', initiatorType: 'fetch' }];
+  const f = fixture({ resources: events });
+  f.doc.body.append(f.img('/actual.gif', 100));
+  const grab = f.run();
+  grab.scan();
+  assert.equal(grab.excludedRows.length, 1);
+  events.push({ name: 'https://mercury.coupang.com/e.gif?r=second', initiatorType: 'beacon' });
+  grab.scan();
+  assert.equal(grab.excludedRows.length, 2);
+  assert.deepEqual(urls(grab), [url('/actual.gif')]);
+});
