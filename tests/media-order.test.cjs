@@ -80,7 +80,7 @@ function fixture({ scrollX = 0, scrollY = 0, resources = [], documentURL = base,
     vm.runInContext(script, context);
     return doc.defaultView.mediaGrab;
   };
-  return { doc, element, img, shadow, run };
+  return { doc, element, img, shadow, run, context };
 }
 const urls = grab => Array.from(grab.urls);
 const visible = grab => Array.from(grab.visibleUrls);
@@ -377,4 +377,56 @@ test('scan preserves unique excluded address history and never adds it to the me
   grab.scan();
   assert.equal(grab.excludedRows.length, 2);
   assert.deepEqual(urls(grab), [url('/actual.gif')]);
+});
+
+test('JSON manifest preserves full ordered addresses and omits excluded events', () => {
+  const long = `https://cdn.example/${'a'.repeat(400)}/image.jpg?token=${'b'.repeat(400)}`;
+  const f = fixture({ resources: [{ name: 'https://mercury.coupang.com/e.gif?r=test', initiatorType: 'beacon' }] });
+  f.doc.title = '상품 테스트';
+  f.doc.body.append(f.img(long, 500), f.img('/first.jpg', 10));
+  const manifest = f.run().getManifest();
+  assert.equal(manifest.schema, 'media-grab/1');
+  assert.equal(manifest.pageUrl, base);
+  assert.equal(manifest.title, '상품 테스트');
+  assert.ok(Number.isFinite(Date.parse(manifest.exportedAt)));
+  assert.deepEqual(Array.from(manifest.items, row => row.url), [url('/first.jpg'), long]);
+  assert.ok(!JSON.stringify(manifest).includes('…'));
+});
+
+test('visible-only manifest includes selected addresses in page order', () => {
+  const f = fixture();
+  f.doc.body.append(f.img('/fallback.jpg', 500, 10, { currentSrc: url('/selected.jpg') }),
+    f.img('/first.jpg', 10));
+  const grab = f.run();
+  assert.equal(grab.getManifest().items.length, 3);
+  const manifest = grab.getManifest({ visibleOnly: true });
+  assert.equal(manifest.visibleOnly, true);
+  assert.deepEqual(Array.from(manifest.items, row => row.url), [url('/first.jpg'), url('/selected.jpg')]);
+});
+
+test('export requests one JSON file and releases its temporary URL', async () => {
+  const f = fixture();
+  f.doc.body.append(f.img('/one.jpg', 10));
+  let exportedBlob, clicked = 0, removed = 0, revoked;
+  const timers = [];
+  const link = { style: {}, click() { clicked++; }, remove() { removed++; } };
+  f.context.Blob = Blob;
+  f.context.URL = class extends URL {
+    static createObjectURL(blob) { exportedBlob = blob; return 'blob:test-export'; }
+    static revokeObjectURL(href) { revoked = href; }
+  };
+  f.context.setTimeout = (callback, delay) => { timers.push({ callback, delay }); };
+  f.doc.createElement = tag => { assert.equal(tag, 'a'); return link; };
+  f.doc.body.appendChild = element => { assert.equal(element, link); };
+  const info = f.run().export();
+  assert.equal(info.count, 1);
+  assert.equal(link.download, 'media-manifest.json');
+  assert.equal(clicked, 1);
+  assert.equal(removed, 1);
+  const content = JSON.parse(await exportedBlob.text());
+  assert.equal(content.items[0].url, url('/one.jpg'));
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 60000);
+  timers[0].callback();
+  assert.equal(revoked, 'blob:test-export');
 });

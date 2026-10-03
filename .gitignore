@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+download-output/
+media-manifest*.json
+media-urls*.txt

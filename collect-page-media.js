@@ -257,6 +257,32 @@
     get excludedRows() { return [...excluded.values()].map(r => ({ ...r })); },
     get excludedUrls() { return [...excluded.keys()]; },
     get blockedFrames() { return [...blockedFrames]; },
+    getManifest({ visibleOnly = false } = {}) {
+      return {
+        schema: "media-grab/1",
+        pageUrl: document.URL || document.location?.href || document.baseURI,
+        title: document.title || "",
+        exportedAt: new Date().toISOString(),
+        visibleOnly: Boolean(visibleOnly),
+        items: visibleOnly ? this.visibleRows : this.rows
+      };
+    },
+    export(options = {}) {
+      const manifest = this.getManifest(options);
+      const blob = new Blob([JSON.stringify(manifest, null, 2)], { type: "application/json;charset=utf-8" });
+      const href = URL.createObjectURL(blob), link = document.createElement("a");
+      link.href = href;
+      link.download = "media-manifest.json";
+      link.style.display = "none";
+      (document.body || document.documentElement).appendChild(link);
+      try { link.click(); }
+      finally {
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(href), 60000);
+      }
+      console.log(`주소 ${manifest.items.length}개의 목록 파일 저장을 요청했습니다: media-manifest.json`);
+      return { filename: "media-manifest.json", count: manifest.items.length, visibleOnly: manifest.visibleOnly };
+    },
     scan() {
       styles = new WeakMap(); layouts = new WeakMap(); elementOrder = 0;
       blockedFrames.clear();
@@ -271,6 +297,7 @@
       console.table(rows);
       console.log(`총 ${found.size}개 URL (페이지 좌표 순서, 위치 미확인 주소는 뒤쪽)\n${rows.map(r => r.url).join("\n")}`);
       console.log(`표시 요소의 선택 주소 ${this.visibleUrls.length}개: copy(mediaGrab.visibleUrls.join('\\n'))`);
+      console.log("일괄 다운로드용 목록 파일 저장: mediaGrab.export()");
       if (excluded.size) console.log(`미디어에서 제외한 통계·이벤트 주소 ${excluded.size}개: mediaGrab.excludedRows`);
       if (blockedFrames.size) console.log("접근할 수 없는 iframe:", this.blockedFrames);
       return rows;
