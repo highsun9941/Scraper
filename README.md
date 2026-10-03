@@ -4,8 +4,9 @@
 페이지의 DOM, CSS 이미지 주소와 현재 남아 있는 Resource Timing 항목을 읽고, 정확히 같은 URL을 중복 제거합니다.
 페이지 내부 SVG 참조와 확인된 통계·이벤트 주소는 미디어 목록에서 제외합니다.
 결과는 페이지 전체의 **위 → 아래, 같은 높이에서는 왼쪽 → 오른쪽** 순서로 정렬합니다.
-브라우저에서 읽을 수 있는 원본 파일은 **콘솔 명령 하나로 ZIP에 묶어 다운로드**합니다. Python이나 외부 JavaScript 라이브러리 설치는 필요하지 않습니다.
-목록 파일을 내보내 별도의 Python 도구로 다운로드하는 방식도 지원합니다.
+Windows 기본 PowerShell로 목록에 있는 파일을 일괄 다운로드할 수 있습니다. **추가 설치는 필요하지 않습니다.**
+브라우저에서 읽을 수 있는 원본 파일은 콘솔 명령으로 ZIP에 묶어 다운로드하는 방식도 지원합니다.
+Python 다운로드 도구는 선택 사항입니다.
 
 ## 윈도우에서 실행하기
 
@@ -18,6 +19,68 @@
 
 `collect-page-media.js`는 상품 페이지 안에서 실행하는 코드입니다. 실행할 페이지의 `window`와 `document`를 사용합니다.
 한 번 실행하면 `window.mediaGrab`에 결과와 재수집 함수가 생깁니다.
+
+## Windows PowerShell로 일괄 다운로드하기 (추가 설치 없음)
+
+브라우저 ZIP에서 `Failed to fetch`가 많이 나왔다면 먼저 이 방식을 사용합니다.
+PowerShell은 브라우저 밖에서 HTTP 요청을 보내므로 JavaScript의 CORS 제한을 적용받지 않습니다.
+서버 자체의 403/404나 로그인 요구까지 해결하는 것은 아닙니다.
+
+1. 이 저장소의 최신 ZIP을 내려받고 **압축을 풉니다**. `download-media-powershell.cmd`와 `download-media.ps1`을 같은 폴더에 둡니다.
+2. **이미 브라우저 ZIP의 `download-report.json`이 있다면 그대로 사용합니다.** 새로 수집하려면 상품 상세를 전부 펼친 뒤 수집 코드를 실행하고, Console에서 아래 명령으로 목록을 저장합니다.
+
+   ```js
+   mediaGrab.export()
+   ```
+
+3. 저장한 **`download-report.json` 또는 `media-manifest.json`을 `download-media-powershell.cmd` 위로 드래그**합니다.
+4. 완료될 때까지 창을 열어 둡니다. 결과는 **입력 파일이 있는 폴더** 아래 `download-output/날짜-시간-식별자/`에 저장합니다. 창 마지막에도 저장 경로를 표시합니다.
+
+Windows PowerShell 5.1과 기본 .NET 기능을 사용합니다. Python, 별도 PowerShell 모듈이나 PowerShell 7을 설치할 필요가 없습니다.
+실행 파일은 이 실행에 한해 `-ExecutionPolicy Bypass`를 적용하며, 컴퓨터의 실행 정책을 영구 변경하지 않습니다.
+
+기존 보고서를 드래그하면 성공·실패 항목을 모두 다시 시도합니다. 정확히 같은 주소는 첫 항목만 유지합니다.
+파일은 `0001.jpg`, `0002.gif`, `0003.mp4`처럼 **입력 목록의 순서를 유지하는 번호**로 저장합니다.
+보고서에 유효한 순번이 있으면 그 순번을 유지하고, 실패한 번호에는 파일이 없어 번호가 중간에 비어 있을 수 있습니다.
+GIF·동영상은 받은 바이트 그대로 저장합니다. 매번 새 결과 폴더를 만들어 기존 결과를 덮어쓰지 않습니다.
+
+| 결과 파일 | 내용 |
+|---|---|
+| `download-report.json` | 모든 주소의 처리 결과. 이 파일을 드래그해 다시 시도할 수 있음 |
+| `download-report.csv` | 순번·저장 파일명·상태·HTTP 상태·원본 URL·오류 내용 |
+| `failed.csv` | 실패하거나 건너뛴 주소와 사유. Excel에서 열 수 있는 UTF-8 BOM 형식 |
+
+`saved`는 미디어 저장, `playlist`는 재생목록만 저장, `failed`는 다운로드·형식 확인 실패, `skipped`는 지원하지 않는 주소 등입니다.
+URL 확장자나 MIME 표기만 믿지 않고 실제 파일 앞부분을 확인하므로 `OK`·HTML·JSON 오류 응답은 미디어로 저장하지 않습니다.
+이 검사는 파일 전체의 재생 가능성이나 실제 애니메이션 여부까지 확인하는 기능은 아닙니다.
+
+스니펫 마지막에 `mediaGrab.download();`를 붙여 사용했다면 **그 줄을 아래로 교체**합니다.
+이후에는 상세 펼치기·스크롤을 끝내고 스니펫을 실행해 목록을 저장한 다음, 목록 파일을 실행 파일에 드래그합니다.
+
+```js
+mediaGrab.export();
+```
+
+명령으로 실행하려면 압축을 푼 저장소 폴더에서 PowerShell을 열고 아래처럼 입력합니다.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\download-media.ps1" -Manifest "C:\Users\사용자\Downloads\media-manifest.json"
+```
+
+보고서의 실패·건너뜀 항목만 재시도하려면 `-OnlyFailed`를 붙입니다.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\download-media.ps1" -Manifest "C:\Users\사용자\Downloads\download-report.json" -OnlyFailed
+```
+
+- 내보낸 `{items, pageUrl}` JSON, 기존 `{results, pageUrl}` 보고서, JSON 배열, CSV 보고서와 한 줄에 URL 하나인 UTF-8 텍스트 목록을 지원합니다. `failed.csv`를 드래그할 수도 있습니다.
+- JSON에 상품 페이지 주소가 있으면 해당 사이트의 출처만 `Referer`로 전달합니다. 상품 페이지 URL의 쿼리는 Referer에 포함하지 않고, 브라우저의 로그인 쿠키도 가져오지 않습니다. 미디어 URL 자체의 쿼리는 유지합니다. CSV·텍스트에는 상품 페이지 주소가 없으므로 출처 정보도 전달되지 않습니다.
+- 한 번에 하나씩 받습니다. `-TimeoutSec 120`으로 파일 한 개의 전체 요청 제한을 조절할 수 있으며 기본은 60초입니다.
+- 기본 파일 한 개의 크기 제한은 256 MiB입니다. `-MaxFileMB 512`처럼 조절할 수 있으며 허용 범위는 1~1024 MiB입니다.
+- `-OutputPath "새 폴더 경로"`로 저장 위치를 지정할 수 있습니다. 이미 존재하는 폴더에는 저장하지 않습니다.
+- 지원하는 형식의 `data:` 주소도 저장합니다. 브라우저 세션에 의존하는 `blob:` 주소는 건너뜁니다.
+- `.m3u8`·`.mpd`는 재생목록만 저장합니다. 영상 조각 병합·DRM 처리는 지원하지 않습니다.
+- 서버 접속 제한과 만료된 주소는 실패 기록에 남기고 다음 파일로 진행합니다. 일부 주소가 실패해도 나머지 다운로드는 계속합니다.
 
 ## 설치 없이 콘솔·스니펫에서 ZIP 다운로드하기
 
@@ -262,14 +325,26 @@ node --test tests/zip-download.test.cjs
 이 통합 테스트의 다운로드는 Node.js의 fetch·스트림을 사용합니다. 브라우저의 실제 CORS 강제 적용이나 실제 다운로드 UI를 검증한 결과는 아닙니다.
 현재 환경에서는 브라우저 실행 파일을 준비하지 못해 실제 Chrome/Edge의 ZIP 다운로드는 직접 검증하지 못했습니다.
 
-다운로드 테스트는 임시 폴더에 결과를 저장하며, Python이 설치된 환경에서 아래 명령으로 실행합니다.
+Python 다운로드 도구 테스트는 임시 폴더에 결과를 저장하며, Python이 설치된 개발 환경에서 아래 명령으로 실행합니다.
 
 ```sh
-python -m unittest discover -s tests -p 'test_*.py' -v
+python -m unittest discover -s tests -p test_downloader.py -v
 ```
 
 11개 테스트로 로컬 HTTP 서버에서의 실제 다운로드, GIF 원본 바이트 보존, 확장자 보정, OK·HTML·JSON 제외, 403/404, 중간에 끊긴 응답, 리다이렉트, Referer, 재생목록, data/blob URL, 동시 다운로드 후의 순번, 실패 보고서와 기존 폴더 보존을 확인했습니다.
 다운로드 로직과 명령줄 실행은 Linux의 Python 3.12에서 검증했습니다. Windows용 `.cmd` 실행 파일은 코드를 검토했으며, Windows에서 직접 실행하지는 못했습니다.
+
+PowerShell 다운로드 도구는 로컬 HTTP 서버와 10개 통합 테스트로 실제 파일 바이트·순번·확장자 보정, 리다이렉트·Referer, 보고서 재사용·실패 항목 재시도, CSV·텍스트 목록, data 주소·큰 data 주소, 오류 응답·재생목록 구분, 크기 제한, 끊긴 응답, 요청·본문 읽기 시간 제한과 기존 폴더 보존을 확인했습니다.
+
+```sh
+python -m unittest discover -s tests -p test_powershell.py -v
+```
+
+이 명령은 개발 테스트에만 Python과 PowerShell이 필요합니다. 사용자용 다운로드 도구는 Python을 사용하지 않습니다.
+PATH의 `powershell` 또는 `pwsh`를 사용하며, `SCRAPER_TEST_POWERSHELL` 환경 변수로 테스트 실행 파일을 지정할 수도 있습니다.
+테스트는 Linux의 PowerShell 7.4.6에서 실행했습니다. Windows PowerShell 5.1과 Windows `.cmd` 실행은 직접 검증하지 못했습니다.
+실제 쿠팡 보고서에서 브라우저 다운로드가 실패했던 HTTPS 상품 JPEG 한 개와 CSS GIF 한 개도 PowerShell 도구로 저장했고, 인라인 SVG 한 개를 함께 저장했습니다.
+이 표본은 당시 해당 주소의 다운로드를 확인한 결과이며, 전체 목록이나 모든 서버의 다운로드 성공을 보장하지 않습니다.
 
 ## GIF 주소를 열었는데 OK 텍스트만 보이는 경우
 
@@ -305,7 +380,7 @@ HTTP 오류나 직접 접근 제한은 URL 수집·정렬 코드를 바꾸는 �
 
 ## 확인한 범위와 제한
 
-- `collect-page-media.js`는 URL 수집·목록 내보내기·브라우저 ZIP 다운로드를 담당합니다. 선택적으로 `download-media.py`로 다운로드할 수도 있으며, 방식별 읽기 권한·지원하는 응답 형식·서버 접근 조건에 따라 저장 여부가 달라집니다.
+- `collect-page-media.js`는 URL 수집·목록 내보내기·브라우저 ZIP 다운로드를 담당합니다. 목록 파일을 `download-media.ps1` 또는 `download-media.py`로 다운로드할 수도 있으며, 방식별 읽기 권한·지원하는 응답 형식·서버 접근 조건에 따라 저장 여부가 달라집니다.
 - 펼치지 않았거나 아직 로딩하지 않아 DOM·Resource Timing에 주소가 없는 미디어는 수집할 수 없습니다.
 - 다른 출처의 iframe 내부는 브라우저의 동일 출처 정책으로 접근이 제한될 수 있습니다. `blockedFrames`를 확인하고, 필요한 상세 iframe을 개발자도구의 실행 컨텍스트에서 선택해 같은 코드를 따로 실행한 뒤 결과를 모읍니다.
 - 파일 형식은 URL과 요소 정보를 바탕으로 추정합니다. 확장자가 없는 GIF나 애니메이션 WebP/APNG는 `IMAGE`로 표시될 수 있습니다. `img`에 노출된 주소는 확장자가 없어도 수집하지만, 실제 애니메이션 여부를 검사하지는 않습니다.
