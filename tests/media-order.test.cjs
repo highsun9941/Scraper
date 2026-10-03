@@ -430,3 +430,165 @@ test('export requests one JSON file and releases its temporary URL', async () =>
   timers[0].callback();
   assert.equal(revoked, 'blob:test-export');
 });
+
+const gifBytes = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+const pngBytes = Buffer.from('89504e470d0a1a0a00000000', 'hex');
+
+function downloadFixture(routes = {}) {
+  const f = fixture(), blobs = new Map(), saves = [], revoked = [], requests = [];
+  f.context.Blob = Blob;
+  f.context.TextEncoder = TextEncoder;
+  f.context.TextDecoder = TextDecoder;
+  f.context.AbortController = AbortController;
+  f.context.setTimeout = setTimeout;
+  f.context.clearTimeout = clearTimeout;
+  f.context.URL = class extends URL {
+    static createObjectURL(blob) { const key = `blob:zip-${blobs.size}`; blobs.set(key, blob); return key; }
+    static revokeObjectURL(href) { revoked.push(href); }
+  };
+  f.context.fetch = async (href, options) => {
+    requests.push({ href, options });
+    const route = routes[href];
+    if (route instanceof Error) throw route;
+    if (typeof route === 'function') return route(options);
+    return route || new Response(gifBytes, { headers: { 'Content-Type': 'image/gif' } });
+  };
+  f.doc.createElement = tag => {
+    assert.equal(tag, 'a');
+    return { style: {}, click() { saves.push({ href: this.href, filename: this.download }); }, remove() {} };
+  };
+  f.doc.body.appendChild = () => {};
+  return { ...f, blobs, saves, revoked, requests };
+}
+
+// Read local ZIP STORE records independently of the writer. The browser
+// integration test also validates the complete ZIP with Python's zipfile.
+async function zipFiles(blob) {
+  const bytes = Buffer.from(await blob.arrayBuffer()), files = new Map();
+  let offset = 0;
+  while (bytes.readUInt32LE(offset) === 0x04034b50) {
+    assert.equal(bytes.readUInt16LE(offset + 8), 0);
+    const size = bytes.readUInt32LE(offset + 18);
+    const nameLength = bytes.readUInt16LE(offset + 26), extraLength = bytes.readUInt16LE(offset + 28);
+    const dataStart = offset + 30 + nameLength + extraLength;
+    files.set(bytes.subarray(offset + 30, offset + 30 + nameLength).toString('utf8'), bytes.subarray(dataStart, dataStart + size));
+    offset = dataStart + size;
+  }
+  assert.equal(bytes.readUInt32LE(offset), 0x02014b50);
+  assert.equal(bytes.readUInt32LE(bytes.length - 22), 0x06054b50);
+  assert.equal(bytes.readUInt16LE(bytes.length - 12), files.size);
+  return files;
+}
+
+test('browser ZIP preserves page order and GIF bytes and corrects misleading extensions', async () => {
+  const f = downloadFixture({ [url('/top.jpg')]: new Response(pngBytes) });
+  f.doc.body.append(f.img('/bottom.jpg', 500), f.img('/top.jpg', 10));
+  const result = await f.run().download();
+  assert.equal(result.results.length, 2);
+  assert.deepEqual(Array.from(result.results, row => row.filename), ['0001.png', '0002.gif']);
+  assert.equal(result.archives.length, 1);
+  assert.equal(f.saves.length, 1);
+  const files = await zipFiles(f.blobs.get(result.archives[0].url));
+  assert.deepEqual([...files.keys()], ['0001.png', '0002.gif', 'download-report.json', 'download-report.csv', 'failed.csv']);
+  assert.deepEqual(files.get('0002.gif'), gifBytes);
+  assert.deepEqual(files.get('0001.png'), pngBytes);
+  for (const { options } of f.requests) {
+    assert.equal(options.mode, 'cors');
+    assert.equal(options.credentials, 'same-origin');
+  }
+});
+
+test('browser ZIP rejects OK, HTML, JSON, HTTP errors and unreadable responses without saving false media', async () => {
+  const f = downloadFixture({
+    [url('/ok.gif')]: new Response('OK', { headers: { 'Content-Type': 'image/gif' } }),
+    [url('/html.jpg')]: new Response('<html>denied</html>'),
+    [url('/json.png')]: new Response('{"status":404}'),
+    [url('/http.jpg')]: new Response('blocked', { status: 403 }),
+    [url('/cors.jpg')]: new TypeError('Failed to fetch'),
+    [url('/opaque.jpg')]: { type: 'opaque', status: 0, headers: new Headers() }
+  });
+  for (const [i, name] of ['ok.gif', 'html.jpg', 'json.png', 'http.jpg', 'cors.jpg', 'opaque.jpg', 'valid.gif'].entries()) f.doc.body.append(f.img('/' + name, i * 100));
+  const result = await f.run().download();
+  assert.deepEqual(Array.from(result.results, row => row.status), ['failed', 'failed', 'failed', 'failed', 'failed', 'failed', 'packed']);
+  assert.equal(result.results[3].httpStatus, 403);
+  const files = await zipFiles(f.blobs.get(result.archives[0].url));
+  assert.deepEqual([...files.keys()].filter(name => /^\d/.test(name)), ['0007.gif']);
+  const report = JSON.parse(files.get('download-report.json'));
+  assert.equal(report.results.filter(row => row.status === 'failed').length, 6);
+  assert.match(files.get('failed.csv').toString('utf8'), /cors\.jpg/);
+});
+
+test('browser ZIP uses selected visible addresses and retains original order numbers for ranges', async () => {
+  const f = downloadFixture();
+  f.doc.body.append(f.img('/fallback.jpg', 100, 0, { currentSrc: url('/selected.jpg') }), f.img('/bottom.gif', 200));
+  const result = await f.run().download({ visibleOnly: true, start: 2 });
+  assert.equal(result.results.length, 1);
+  assert.equal(result.results[0].order, 3);
+  assert.equal(result.results[0].filename, '0003.gif');
+  assert.equal(f.requests[0].href, url('/bottom.gif'));
+});
+
+test('browser ZIP splits large batches into independent archives and can retry a save or release URLs', async () => {
+  const f = downloadFixture();
+  f.doc.body.append(f.img('/one.gif', 100), f.img('/two.gif', 200));
+  const grab = f.run(), result = await grab.download({ maxZipMB: gifBytes.length / 1024 ** 2 });
+  assert.equal(result.archives.length, 2);
+  const first = await zipFiles(f.blobs.get(result.archives[0].url));
+  const second = await zipFiles(f.blobs.get(result.archives[1].url));
+  assert.deepEqual([...first.keys()].filter(name => /^\d/.test(name)), ['0001.gif']);
+  assert.deepEqual([...second.keys()].filter(name => /^\d/.test(name)), ['0002.gif']);
+  assert.equal(JSON.parse(first.get('download-report.json')).results.length, 1);
+  grab.saveArchive(2);
+  assert.equal(f.saves.length, 3);
+  assert.equal(f.saves[2].href, result.archives[1].url);
+  grab.clearDownloads();
+  assert.deepEqual(f.revoked, Array.from(result.archives, archive => archive.url));
+  assert.equal(grab.lastDownload, null);
+});
+
+test('browser ZIP bounds downloads even without Content-Length and leaves oversized files in failed report', async () => {
+  const f = downloadFixture({
+    [url('/stream.gif')]: new Response(gifBytes),
+    [url('/length.gif')]: new Response(gifBytes, { headers: { 'Content-Length': String(gifBytes.length) } })
+  });
+  f.doc.body.append(f.img('/stream.gif', 100), f.img('/length.gif', 200));
+  const result = await f.run().download({ maxFileMB: 16 / 1024 ** 2 });
+  assert.ok(result.results.every(row => row.status === 'failed' && row.message.includes('크기 제한')));
+  const files = await zipFiles(f.blobs.get(result.archives[0].url));
+  assert.equal([...files.keys()].filter(name => /^\d/.test(name)).length, 0);
+});
+
+test('browser ZIP timeout ends an unreadable request and continues with remaining URLs', async () => {
+  const f = downloadFixture({ [url('/timeout.gif')]: ({ signal }) => new Promise((resolve, reject) => {
+    signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+  }) });
+  f.doc.body.append(f.img('/timeout.gif', 100), f.img('/works.gif', 200));
+  const result = await f.run().download({ timeoutMs: 10 });
+  assert.equal(result.results[0].status, 'failed');
+  assert.match(result.results[0].message, /대기 시간/);
+  assert.equal(result.results[1].status, 'packed');
+});
+
+test('browser ZIP cancellation retains a report and prevents overlapping downloads', async () => {
+  const f = downloadFixture({ [url('/wait.gif')]: ({ signal }) => new Promise((resolve, reject) => {
+    signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+  }) });
+  f.doc.body.append(f.img('/wait.gif', 100), f.img('/next.gif', 200));
+  const grab = f.run(), pending = grab.download();
+  await assert.rejects(grab.download(), /이미 다운로드 중/);
+  assert.throws(() => grab.clearDownloads(), /다운로드 중/);
+  grab.stopDownload();
+  const result = await pending;
+  assert.equal(result.cancelled, true);
+  assert.ok(result.results.every(row => row.status === 'skipped'));
+  assert.equal(f.requests.length, 1);
+});
+
+test('browser ZIP stores stream playlists without claiming a complete video', async () => {
+  const f = downloadFixture({ [url('/video.m3u8')]: new Response('#EXTM3U\npart.ts\n') });
+  f.doc.body.append(f.element('a', { attrs: { href: '/video.m3u8' } }));
+  const result = await f.run().download();
+  assert.equal(result.results[0].status, 'playlist');
+  assert.equal(result.results[0].filename, '0001.m3u8');
+  assert.match(result.results[0].message, /영상 조각/);
+});

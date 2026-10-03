@@ -249,6 +249,129 @@
     order: i + 1, type: r.type, url: r.url, source: r.source, temporary: r.temporary,
     top: r.position?.top ?? null, left: r.position?.left ?? null, visible: r.visible
   }));
+  // 외부 라이브러리 없이 ZIP STORE를 만듭니다. 원본 미디어를 재인코딩하지 않습니다.
+  const crcTable = Uint32Array.from({ length: 256 }, (_, n) => {
+    for (let bit = 0; bit < 8; bit++) n = n & 1 ? 0xedb88320 ^ n >>> 1 : n >>> 1;
+    return n >>> 0;
+  });
+  const crcUpdate = (crc, bytes) => {
+    for (const byte of bytes) crc = crcTable[(crc ^ byte) & 255] ^ crc >>> 8;
+    return crc;
+  };
+  const mediaExtension = bytes => {
+    const starts = signature => signature.every((byte, i) => bytes[i] === byte);
+    const ascii = (start, end) => String.fromCharCode(...bytes.subarray(start, end));
+    if (starts([255, 216, 255])) return ".jpg";
+    if (starts([137, 80, 78, 71, 13, 10, 26, 10])) return ".png";
+    if (["GIF87a", "GIF89a"].includes(ascii(0, 6))) return ".gif";
+    if (ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP") return ".webp";
+    if (ascii(0, 4) === "RIFF" && ascii(8, 12) === "AVI ") return ".avi";
+    if (["II*\0", "MM\0*", "II+\0", "MM\0+"].includes(ascii(0, 4))) return ".tiff";
+    if (ascii(0, 2) === "BM" && bytes.length >= 14) return ".bmp";
+    if (starts([0, 0, 1, 0]) && bytes.length >= 6) return ".ico";
+    if (ascii(4, 8) === "ftyp") {
+      const end = Math.min(bytes.length, new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0));
+      const brands = [ascii(8, 12)];
+      for (let i = 16; i + 4 <= end; i += 4) brands.push(ascii(i, i + 4));
+      if (brands.some(x => ["avif", "avis"].includes(x))) return ".avif";
+      if (brands.some(x => ["heic", "heix", "hevc", "hevx"].includes(x))) return ".heic";
+      if (brands.some(x => ["mif1", "msf1"].includes(x))) return ".heif";
+      return brands.includes("qt  ") ? ".mov" : ".mp4";
+    }
+    if (starts([26, 69, 223, 163])) return ascii(0, 4096).includes("webm") ? ".webm" : ".mkv";
+    if (ascii(0, 4) === "OggS") return ".ogv";
+    if (starts([0, 0, 1, 186]) || starts([0, 0, 1, 179])) return ".mpeg";
+    let text = new TextDecoder().decode(bytes).trimStart();
+    if (text.startsWith("#EXTM3U")) return ".m3u8";
+    text = text.replace(/^<\?xml\b[\s\S]*?\?>\s*/, "");
+    while (text.startsWith("<!--") && text.includes("-->")) text = text.slice(text.indexOf("-->") + 3).trimStart();
+    text = text.replace(/^<!DOCTYPE\s+svg\b[^>]*>\s*/i, "");
+    if (/^<svg(?:\s|>)/.test(text)) return ".svg";
+    if (/^<(?:[\w.-]+:)?MPD(?:\s|>)/.test(text)) return ".mpd";
+    return null;
+  };
+  const textEntry = (name, text) => {
+    const bytes = new TextEncoder().encode(text);
+    return { name, blob: new Blob([bytes]), size: bytes.length, crc: (crcUpdate(0xffffffff, bytes) ^ 0xffffffff) >>> 0 };
+  };
+  const makeZip = entries => {
+    const encoder = new TextEncoder(), local = [], central = [];
+    let offset = 0, centralSize = 0;
+    const now = new Date(), year = Math.min(2107, Math.max(1980, now.getFullYear()));
+    const time = now.getHours() << 11 | now.getMinutes() << 5 | now.getSeconds() >>> 1;
+    const date = year - 1980 << 9 | now.getMonth() + 1 << 5 | now.getDate();
+    if (entries.length >= 65535) throw new Error("ZIP 항목 수가 너무 많습니다.");
+    for (const entry of entries) {
+      const name = encoder.encode(entry.name), header = new Uint8Array(30 + name.length);
+      const h = new DataView(header.buffer);
+      h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true);
+      h.setUint16(10, time, true); h.setUint16(12, date, true); h.setUint32(14, entry.crc, true);
+      h.setUint32(18, entry.size, true); h.setUint32(22, entry.size, true); h.setUint16(26, name.length, true);
+      header.set(name, 30);
+      const directory = new Uint8Array(46 + name.length), d = new DataView(directory.buffer);
+      d.setUint32(0, 0x02014b50, true); d.setUint16(4, 20, true); d.setUint16(6, 20, true);
+      d.setUint16(8, 0x0800, true); d.setUint16(12, time, true); d.setUint16(14, date, true);
+      d.setUint32(16, entry.crc, true); d.setUint32(20, entry.size, true); d.setUint32(24, entry.size, true);
+      d.setUint16(28, name.length, true); d.setUint32(42, offset, true); directory.set(name, 46);
+      local.push(header, entry.blob); central.push(directory);
+      offset += header.length + entry.size; centralSize += directory.length;
+      if (offset + centralSize + 22 >= 0xffffffff) throw new Error("ZIP32의 용량 한도를 넘었습니다.");
+    }
+    const end = new Uint8Array(22), e = new DataView(end.buffer);
+    e.setUint32(0, 0x06054b50, true); e.setUint16(8, entries.length, true); e.setUint16(10, entries.length, true);
+    e.setUint32(12, centralSize, true); e.setUint32(16, offset, true);
+    return new Blob([...local, ...central, end], { type: "application/zip" });
+  };
+  const requestSave = (href, filename) => {
+    const link = document.createElement("a");
+    link.href = href; link.download = filename; link.style.display = "none";
+    (document.body || document.documentElement).appendChild(link);
+    try { link.click(); } finally { link.remove(); }
+  };
+  const reportCSV = rows => {
+    const fields = ["order", "status", "filename", "bytes", "httpStatus", "contentType", "url", "message"];
+    const quote = value => `"${String(value ?? "").replace(/"/g, '""')}"`;
+    return "\ufeff" + [fields, ...rows.map(row => fields.map(field => row[field]))]
+      .map(row => row.map(quote).join(",")).join("\r\n") + "\r\n";
+  };
+  const readMedia = async (url, options, signal) => {
+    const controller = new AbortController(), abort = () => controller.abort();
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    const timer = setTimeout(abort, options.timeoutMs);
+    let response;
+    try {
+      response = await fetch(url, { mode: "cors", credentials: options.credentials, signal: controller.signal });
+      if (response.type === "opaque" || response.type === "opaqueredirect") throw new Error("응답 내용을 읽을 권한이 없습니다.");
+      if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+      if (Number(response.headers.get("Content-Length")) > options.maxFileBytes) throw new Error("파일 크기 제한을 넘었습니다.");
+      if (!response.body) throw new Error("응답 본문이 없습니다.");
+      const reader = response.body.getReader(), chunks = [], prefix = new Uint8Array(16384);
+      let size = 0, prefixSize = 0, crc = 0xffffffff;
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (size > options.maxFileBytes) throw new Error("파일 크기 제한을 넘었습니다.");
+          const head = value.subarray(0, prefix.length - prefixSize);
+          prefix.set(head, prefixSize); prefixSize += head.length;
+          crc = crcUpdate(crc, value); chunks.push(value);
+        }
+      } finally { reader.releaseLock(); }
+      const extension = mediaExtension(prefix.subarray(0, prefixSize));
+      if (!extension) throw new Error("지원하는 미디어 형식이 아닙니다. OK·HTML·JSON 또는 손상된 응답일 수 있습니다.");
+      return { blob: new Blob(chunks), size, crc: (crc ^ 0xffffffff) >>> 0, extension,
+        httpStatus: response.status, contentType: response.headers.get("Content-Type") || "" };
+    } catch (error) {
+      const message = signal.aborted ? "사용자가 중단했습니다." : controller.signal.aborted ? "요청 대기 시간을 넘었습니다." :
+        error instanceof TypeError ? `브라우저에서 응답을 읽지 못했습니다(CORS·CSP·접속 제한 등): ${error.message}` : error.message;
+      const failure = new Error(message);
+      failure.httpStatus = response?.status || ""; failure.contentType = response?.headers.get("Content-Type") || "";
+      throw failure;
+    } finally { clearTimeout(timer); controller.abort(); signal.removeEventListener("abort", abort); }
+  };
+  let downloadController = null, downloadReport = null;
   window.mediaGrab = {
     get rows() { return ordered(); },
     get urls() { return this.rows.map(r => r.url); },
@@ -257,6 +380,82 @@
     get excludedRows() { return [...excluded.values()].map(r => ({ ...r })); },
     get excludedUrls() { return [...excluded.keys()]; },
     get blockedFrames() { return [...blockedFrames]; },
+    get lastDownload() { return downloadReport; },
+    clearDownloads() {
+      if (downloadController) throw new Error("다운로드 중에는 결과를 해제할 수 없습니다.");
+      for (const archive of downloadReport?.archives || []) URL.revokeObjectURL(archive.url);
+      downloadReport = null;
+    },
+    stopDownload() { downloadController?.abort(); },
+    saveArchive(index = 1) {
+      const archive = downloadReport?.archives[index - 1];
+      if (!archive) throw new Error("해당 ZIP이 없습니다. mediaGrab.lastDownload.archives를 확인하세요.");
+      requestSave(archive.url, archive.filename);
+      return { filename: archive.filename, downloadRequested: true };
+    },
+    async download({ visibleOnly = false, start = 1, end = Infinity, maxFileMB = 256,
+        maxZipMB = 256, timeoutMs = 30000, credentials = "same-origin" } = {}) {
+      if (downloadController) throw new Error("이미 다운로드 중입니다. 중단하려면 mediaGrab.stopDownload()를 실행하세요.");
+      if (![maxFileMB, maxZipMB].every(x => Number.isFinite(x) && x > 0 && x <= 1024) ||
+          !Number.isFinite(timeoutMs) || timeoutMs <= 0 || !Number.isInteger(start) || start < 1 ||
+          !(end === Infinity || Number.isInteger(end) && end >= start) ||
+          !["same-origin", "omit", "include"].includes(credentials)) throw new Error("다운로드 옵션을 확인하세요.");
+      const rows = (visibleOnly ? this.visibleRows : this.rows).filter(row => row.order >= start && row.order <= end);
+      if (!rows.length) throw new Error("대상 주소가 없습니다. 상세내용을 펼치고 mediaGrab.scan()으로 다시 수집하세요.");
+      this.clearDownloads();
+      downloadController = new AbortController();
+      const signal = downloadController.signal, width = Math.max(4, String(rows.at(-1).order).length);
+      const options = { timeoutMs, credentials, maxFileBytes: Math.floor(maxFileMB * 1024 ** 2) };
+      const zipLimit = Math.floor(maxZipMB * 1024 ** 2), stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "");
+      const pageUrl = document.URL || document.baseURI;
+      downloadReport = { schema: "media-grab-download/1", pageUrl, startedAt: new Date().toISOString(),
+        finishedAt: null, results: [], archives: [], cancelled: false };
+      let entries = [], partResults = [], partBytes = 0;
+      const flush = () => {
+        if (!partResults.length) return;
+        const index = downloadReport.archives.length + 1, filename = `page-media-${stamp}-${String(index).padStart(3, "0")}.zip`;
+        const blob = makeZip([...entries,
+          textEntry("download-report.json", JSON.stringify({ pageUrl, results: partResults }, null, 2)),
+          textEntry("download-report.csv", reportCSV(partResults)),
+          textEntry("failed.csv", reportCSV(partResults.filter(row => ["failed", "skipped"].includes(row.status))))]);
+        const archive = { index, filename, bytes: blob.size, url: URL.createObjectURL(blob), downloadRequested: false };
+        downloadReport.archives.push(archive);
+        try { requestSave(archive.url, filename); archive.downloadRequested = true; }
+        catch (error) { archive.message = error.message; }
+        console.log(`ZIP ${index} 저장 요청: ${filename}. 시작되지 않으면 mediaGrab.saveArchive(${index})`);
+        entries = []; partResults = []; partBytes = 0;
+      };
+      console.log(`브라우저에서 ${rows.length}개 주소를 읽어 ZIP으로 저장합니다. 중단: mediaGrab.stopDownload()`);
+      try {
+        for (const [i, row] of rows.entries()) {
+          const result = { ...row, status: "failed", filename: "", bytes: 0, httpStatus: "", contentType: "", message: "" };
+          if (signal.aborted) Object.assign(result, { status: "skipped", message: "사용자가 중단했습니다." });
+          else {
+            try {
+              const data = await readMedia(row.url, options, signal);
+              if (entries.length && (partBytes + data.size > zipLimit || entries.length >= 10000)) flush();
+              const filename = `${String(row.order).padStart(width, "0")}${data.extension}`;
+              entries.push({ name: filename, ...data }); partBytes += data.size;
+              Object.assign(result, { status: [".m3u8", ".mpd"].includes(data.extension) ? "playlist" : "packed",
+                filename, bytes: data.size, httpStatus: data.httpStatus, contentType: data.contentType });
+              if (result.status === "playlist") result.message = "재생목록만 저장합니다. 영상 조각을 합치지는 않습니다.";
+            } catch (error) {
+              Object.assign(result, { status: signal.aborted ? "skipped" : "failed", message: error.message,
+                httpStatus: error.httpStatus || "", contentType: error.contentType || "" });
+            }
+          }
+          partResults.push(result); downloadReport.results.push(result);
+          if ((i + 1) % 25 === 0 || i + 1 === rows.length) console.log(`ZIP 준비 ${i + 1}/${rows.length}`);
+        }
+        flush();
+        downloadReport.cancelled = signal.aborted; downloadReport.finishedAt = new Date().toISOString();
+        const packed = downloadReport.results.filter(row => row.status === "packed").length;
+        const playlists = downloadReport.results.filter(row => row.status === "playlist").length;
+        console.log(`완료: 미디어 ${packed}개 / 재생목록 ${playlists}개 / 실패·건너뜀 ${rows.length - packed - playlists}개 / ZIP ${downloadReport.archives.length}개`);
+        console.log("상세 결과: mediaGrab.lastDownload. ZIP 안의 failed.csv에서 실패 주소를 확인하세요.");
+        return downloadReport;
+      } finally { downloadController = null; }
+    },
     getManifest({ visibleOnly = false } = {}) {
       return {
         schema: "media-grab/1",
@@ -298,6 +497,7 @@
       console.log(`총 ${found.size}개 URL (페이지 좌표 순서, 위치 미확인 주소는 뒤쪽)\n${rows.map(r => r.url).join("\n")}`);
       console.log(`표시 요소의 선택 주소 ${this.visibleUrls.length}개: copy(mediaGrab.visibleUrls.join('\\n'))`);
       console.log("일괄 다운로드용 목록 파일 저장: mediaGrab.export()");
+      console.log("설치 없이 브라우저에서 ZIP 다운로드: await mediaGrab.download()");
       if (excluded.size) console.log(`미디어에서 제외한 통계·이벤트 주소 ${excluded.size}개: mediaGrab.excludedRows`);
       if (blockedFrames.size) console.log("접근할 수 없는 iframe:", this.blockedFrames);
       return rows;

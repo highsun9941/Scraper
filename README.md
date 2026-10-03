@@ -4,7 +4,8 @@
 페이지의 DOM, CSS 이미지 주소와 현재 남아 있는 Resource Timing 항목을 읽고, 정확히 같은 URL을 중복 제거합니다.
 페이지 내부 SVG 참조와 확인된 통계·이벤트 주소는 미디어 목록에서 제외합니다.
 결과는 페이지 전체의 **위 → 아래, 같은 높이에서는 왼쪽 → 오른쪽** 순서로 정렬합니다.
-수집한 목록을 파일로 내보낸 뒤, 별도의 Python 도구로 미디어 파일을 일괄 다운로드할 수 있습니다.
+브라우저에서 읽을 수 있는 원본 파일은 **콘솔 명령 하나로 ZIP에 묶어 다운로드**합니다. Python이나 외부 JavaScript 라이브러리 설치는 필요하지 않습니다.
+목록 파일을 내보내 별도의 Python 도구로 다운로드하는 방식도 지원합니다.
 
 ## 윈도우에서 실행하기
 
@@ -18,7 +19,61 @@
 `collect-page-media.js`는 상품 페이지 안에서 실행하는 코드입니다. 실행할 페이지의 `window`와 `document`를 사용합니다.
 한 번 실행하면 `window.mediaGrab`에 결과와 재수집 함수가 생깁니다.
 
-## 윈도우에서 일괄 다운로드하기
+## 설치 없이 콘솔·스니펫에서 ZIP 다운로드하기
+
+최신 `collect-page-media.js`로 수집한 뒤, 상품 페이지의 Console에서 실행합니다.
+
+```js
+await mediaGrab.download()
+```
+
+브라우저가 읽을 수 있는 파일을 받은 뒤 `page-media-날짜-시간-001.zip` 저장을 요청합니다.
+ZIP을 풀면 `0001.jpg`, `0002.gif`, `0003.mp4`처럼 **페이지 순서의 번호가 붙은 원본 파일**이 나옵니다.
+GIF와 영상의 받은 바이트를 그대로 보존합니다. 순번은 전체 수집 목록을 기준으로 하며, 실패·필터로 제외된 번호에는 파일이 없습니다.
+실제 파일 앞부분의 형식 표식을 확인하므로, `.gif` 주소의 `OK`나 HTML·JSON 오류 본문을 미디어 파일로 저장하지 않습니다.
+
+DevTools의 **Sources → Snippets**에 코드를 저장해 사용한다면, 수집 코드 마지막 줄 다음에 아래 한 줄을 추가합니다.
+이후 스니펫 실행 한 번으로 수집과 다운로드를 시작할 수 있습니다. 상품 상세 펼치기·스크롤은 실행 전에 완료합니다.
+
+```js
+mediaGrab.download();
+```
+
+각 ZIP에는 해당 ZIP에 대응하는 `download-report.json`, `download-report.csv`, `failed.csv`도 들어 있습니다.
+`packed`는 원본 파일을 읽어 ZIP에 넣었다는 의미이며, 브라우저가 사용자 디스크에 저장한 사실까지 확인하는 값은 아닙니다.
+`playlist`는 재생목록만 포함, `failed`는 읽기·형식 확인 실패, `skipped`는 중단으로 처리하지 않은 주소입니다.
+전체 결과는 `mediaGrab.lastDownload`에서 확인합니다.
+
+| 명령 | 동작 |
+|---|---|
+| `await mediaGrab.download({ visibleOnly: true })` | 표시되는 요소의 선택 주소만 받기. 현재 viewport 안으로 제한하는 옵션은 아님 |
+| `await mediaGrab.download({ start: 1, end: 100 })` | 전체 수집 목록의 지정 순번만 받기 |
+| `mediaGrab.stopDownload()` | 현재 요청을 중단하고 남은 주소를 건너뛴 보고서와 ZIP 만들기 |
+| `mediaGrab.lastDownload.results` | 모든 주소의 처리 결과 보기 |
+| `mediaGrab.lastDownload.archives` | 생성한 ZIP의 목록·크기·임시 링크 보기 |
+| `mediaGrab.saveArchive(1)` | 생성한 첫 번째 ZIP의 저장을 다시 요청하기. 두 번째는 `2` |
+| `mediaGrab.clearDownloads()` | 다운로드가 끝난 뒤 ZIP 임시 URL과 결과 참조 해제 |
+
+### 우클릭 저장과 다른 점
+
+우클릭의 **이미지를 다른 이름으로 저장**은 브라우저 자체의 저장 기능입니다.
+콘솔 스크립트가 원본을 읽어 ZIP에 넣으려면 해당 응답을 JavaScript에서 읽을 수 있어야 합니다.
+이미지가 화면에 보이더라도, 다른 출처의 이미지 서버가 CORS를 허용하지 않으면 원본 읽기는 실패할 수 있습니다.
+[`fetch`의 CORS·credentials 설명](https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch)을 참고하세요.
+`mode: 'no-cors'`로 바꾸면 읽을 수 없는 opaque 응답이 되므로 원본을 저장하는 해결책이 아닙니다.
+이미지 URL에 `download` 속성만 붙이는 방식도 다른 출처에서는 일괄 저장을 보장하지 않습니다. [링크의 download 제한](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/a#download)
+
+- CORS·CSP·혼합 콘텐츠 제한, 403/404, 만료된 주소는 보고서에 기록하고 다음 파일로 진행합니다. 네트워크 오류만으로 구체적인 차단 원인을 확정하지 않습니다.
+- 기본 `credentials: 'same-origin'`으로 같은 출처의 세션은 사용하며, 다른 출처에는 쿠키를 보내지 않습니다. `{ credentials: 'include' }`를 지정할 수 있으나, 서버의 CORS 자격 증명 허용과 브라우저 쿠키 정책이 충족되어야 합니다.
+- 접근 가능한 `data:`와 실제 파일을 담은 `blob:`은 지원합니다. MediaSource에 연결된 `blob:` 영상은 완성된 파일이 아니므로 이 방식으로 저장을 보장할 수 없습니다.
+- `.m3u8`·`.mpd`는 재생목록만 저장합니다. 영상 조각 병합·DRM 처리는 지원하지 않습니다.
+- 기본 파일 한 개의 제한은 256 MiB입니다. ZIP의 미디어 합계가 약 256 MiB를 넘으면 별도의 독립 ZIP으로 나눕니다. 한 파일은 나누지 않으므로 ZIP 자체의 크기는 이 기준을 넘을 수 있습니다. 메타데이터 크기도 추가됩니다.
+- `{ maxFileMB: 512, maxZipMB: 256 }`처럼 크기 제한을 조절할 수 있으며 두 옵션은 0 초과~1024 MiB까지입니다. ZIP 데이터는 브라우저에서 보관하므로 용량이 크면 순번 범위를 나누어 받습니다.
+- 여러 ZIP의 자동 저장을 브라우저가 막으면 해당 사이트의 여러 파일 다운로드를 허용하거나 `saveArchive(번호)`로 각각 저장합니다. 이 API는 저장 요청만 하며, 브라우저의 저장 설정을 변경하지 않습니다.
+- 원본은 한 번에 하나씩 받습니다. `{ timeoutMs: 60000 }`으로 파일 한 개의 요청 제한을 60초로 조절할 수 있습니다. 기본은 30초이며 파일 읽기 전체에 적용합니다.
+- 다음 `download()` 실행은 이전 ZIP 임시 URL을 해제합니다. 저장이 끝나면 `clearDownloads()`를 실행하거나 페이지를 닫아 참조를 정리할 수 있습니다.
+
+## 선택: Python으로 윈도우에서 일괄 다운로드하기
 
 1. **Python 3.10 이상**을 설치합니다. [공식 Windows 다운로드](https://www.python.org/downloads/windows/)에서 설치할 수 있으며, 별도 Python 패키지는 필요하지 않습니다.
 2. 이 저장소의 최신 ZIP을 받아 압축을 풉니다. `download-media.cmd`와 `download-media.py`를 같은 폴더에 둡니다.
@@ -111,6 +166,9 @@ mediaGrab.export()
 
 // 파일 저장 없이 목록 객체 확인
 mediaGrab.getManifest()
+
+// 브라우저에서 원본을 읽어 ZIP 다운로드
+await mediaGrab.download()
 ```
 
 Chrome/Edge 개발자도구 Console의 `copy()`로 주소를 클립보드에 복사할 수 있습니다.
@@ -187,11 +245,22 @@ node --check collect-page-media.js
 node --test tests/media-order.test.cjs
 ```
 
-24개 자동 테스트로 로딩·DOM 순서와 다른 좌표 정렬, 700개 주소의 보존과 정렬, 반응형 이미지 후보, 숨긴 복제본, 재수집, 스크롤, CSS·GIF·영상, Shadow DOM, iframe 좌표·접근 상태와 위치 계산 실패를 확인했습니다.
+32개 자동 테스트로 로딩·DOM 순서와 다른 좌표 정렬, 700개 주소의 보존과 정렬, 반응형 이미지 후보, 숨긴 복제본, 재수집, 스크롤, CSS·GIF·영상, Shadow DOM, iframe 좌표·접근 상태와 위치 계산 실패를 확인했습니다.
 SVG 내부 참조 제외는 절대 주소·CSS 이스케이프·별도의 base URI·iframe 문서에서 검증했으며, 외부 SVG 및 data 이미지 주소는 유지합니다.
 Mercury 이벤트 주소 제외는 네트워크·DOM·CSS 경로와 재수집에서 검증했습니다. 392개 이미지 후보와 CSS GIF 한 개를 보존하면서 이벤트 주소 67개를 분리하는 모의 사례와, 일반 GIF를 fetch/XHR로 수집하는 사례도 포함합니다.
 테스트는 위치·표시 상태를 지정한 모의 DOM에서 수행하며, 실제 브라우저의 렌더링이나 쿠팡 페이지에서 새 정렬 기능을 검증한 기록은 아닙니다.
 목록 파일 내보내기는 긴 URL의 전체 문자열 보존·순서·선택 주소 필터·Blob을 통한 한 파일의 저장 요청을 모의 환경에서 검증했습니다. 실제 브라우저의 다운로드 UI는 검증하지 않았습니다.
+브라우저 ZIP 기능은 원본 바이트·순번·확장자 보정, OK·HTML·JSON·HTTP 오류·읽을 수 없는 응답 제외, 대상 범위, ZIP 분할, 크기 제한, 요청 시간 제한, 중단·동시 실행 방지와 재생목록 구분을 포함합니다.
+
+실제 로컬 HTTP 서버에서 700개 애니메이션 GIF와 403 주소 한 개를 처리한 ZIP 통합 테스트도 있습니다.
+개발 환경의 Python 표준 라이브러리 `zipfile`로 모든 파일의 CRC·압축 해제·원본 바이트·순번·실패 보고서를 독립적으로 확인합니다. Python은 이 검증 도구에만 필요하며, 브라우저 ZIP 기능 사용에는 필요하지 않습니다.
+
+```sh
+node --test tests/zip-download.test.cjs
+```
+
+이 통합 테스트의 다운로드는 Node.js의 fetch·스트림을 사용합니다. 브라우저의 실제 CORS 강제 적용이나 실제 다운로드 UI를 검증한 결과는 아닙니다.
+현재 환경에서는 브라우저 실행 파일을 준비하지 못해 실제 Chrome/Edge의 ZIP 다운로드는 직접 검증하지 못했습니다.
 
 다운로드 테스트는 임시 폴더에 결과를 저장하며, Python이 설치된 환경에서 아래 명령으로 실행합니다.
 
@@ -236,7 +305,7 @@ HTTP 오류나 직접 접근 제한은 URL 수집·정렬 코드를 바꾸는 �
 
 ## 확인한 범위와 제한
 
-- `collect-page-media.js`는 URL 수집·목록 내보내기를 담당합니다. 파일 자체는 별도의 `download-media.py`로 다운로드하며, 지원하는 응답 형식과 서버 접근 조건에 따라 저장 여부가 달라집니다.
+- `collect-page-media.js`는 URL 수집·목록 내보내기·브라우저 ZIP 다운로드를 담당합니다. 선택적으로 `download-media.py`로 다운로드할 수도 있으며, 방식별 읽기 권한·지원하는 응답 형식·서버 접근 조건에 따라 저장 여부가 달라집니다.
 - 펼치지 않았거나 아직 로딩하지 않아 DOM·Resource Timing에 주소가 없는 미디어는 수집할 수 없습니다.
 - 다른 출처의 iframe 내부는 브라우저의 동일 출처 정책으로 접근이 제한될 수 있습니다. `blockedFrames`를 확인하고, 필요한 상세 iframe을 개발자도구의 실행 컨텍스트에서 선택해 같은 코드를 따로 실행한 뒤 결과를 모읍니다.
 - 파일 형식은 URL과 요소 정보를 바탕으로 추정합니다. 확장자가 없는 GIF나 애니메이션 WebP/APNG는 `IMAGE`로 표시될 수 있습니다. `img`에 노출된 주소는 확장자가 없어도 수집하지만, 실제 애니메이션 여부를 검사하지는 않습니다.
