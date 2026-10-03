@@ -82,6 +82,38 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\download-media.ps1" -
 - `.m3u8`·`.mpd`는 재생목록만 저장합니다. 영상 조각 병합·DRM 처리는 지원하지 않습니다.
 - 서버 접속 제한과 만료된 주소는 실패 기록에 남기고 다음 파일로 진행합니다. 일부 주소가 실패해도 나머지 다운로드는 계속합니다.
 
+## 리뷰 영상이 blob 주소로만 잡힐 때
+
+`video.currentSrc`가 `blob:https://...`이면 브라우저 내부 객체를 가리키는 임시 주소입니다.
+이 주소는 완성된 영상 파일을 담은 Blob 또는 조각을 재생하는 MediaSource에 연결될 수 있습니다. 주소만으로 둘을 구분할 수 없습니다.
+PowerShell 도구는 이 주소를 건너뛰며, 브라우저 ZIP 기능도 MediaSource 자체를 영상 파일로 받지는 못합니다.
+
+Video.js 재생기는 DOM 영상 주소와 별도로 원본 소스를 보관할 수 있습니다.
+수집기는 재생 요소의 `.player` 참조 또는 `videojs.getPlayer()`로 이미 있는 재생기를 찾아 `currentSource()`·`currentSources()`·`currentSrc()`를 읽습니다.
+소스 주소에 확장자가 없더라도 HLS·DASH MIME이면 `STREAM`으로 표시합니다. [Video.js Player API](https://docs.videojs.com/player)
+재생기를 새로 만들거나 재생·소스 변경 명령을 실행하지 않습니다.
+
+1. 최신 `collect-page-media.js`의 **전체 코드로 스니펫을 교체**합니다.
+2. 리뷰 영상 창을 열고 재생한 뒤, 창을 열어 둔 상태에서 새 수집 코드를 실행합니다. 이미 새 코드를 실행했다면 재생 후 `mediaGrab.scan()`을 실행합니다.
+3. 아래 명령으로 브라우저 밖에서도 사용할 수 있는 영상·재생목록 주소를 확인하고, 전체 URL을 클립보드에 복사합니다.
+
+   ```js
+   (() => {
+     mediaGrab.scan();
+     const rows = mediaGrab.rows.filter(r =>
+       ["VIDEO", "STREAM"].includes(r.type) && !r.temporary);
+     console.table(rows);
+     copy(JSON.stringify(rows, null, 2));
+   })();
+   ```
+
+4. 원본 주소가 잡혔다면 `mediaGrab.export()`로 새 목록을 저장해 PowerShell 도구에 전달할 수 있습니다. **MP4 등 직접 파일은 영상으로, HLS·DASH는 재생목록 파일까지만 저장**합니다. 조각 병합 기능은 아직 없습니다.
+
+`source`가 `videojs.currentSource` 등으로 표시되면 재생기에서 읽은 주소입니다. 다른 경로에서 같은 URL을 먼저 수집했다면 그 경로가 표시될 수도 있습니다.
+재생기의 API를 페이지에서 접근할 수 없거나 원본 주소 대신 blob만 보관하면 이 경로로 원본 URL을 찾을 수 없습니다.
+원본 주소가 수집됐다는 사실도 서버에서의 다운로드 성공을 보장하지는 않습니다.
+그대로 복사한 재생창 HTML에는 런타임 재생기 객체가 들어 있지 않으므로, 원본 URL이 HTML에 없을 때는 실제 페이지에서 코드를 실행해야 합니다.
+
 ## 설치 없이 콘솔·스니펫에서 ZIP 다운로드하기
 
 최신 `collect-page-media.js`로 수집한 뒤, 상품 페이지의 Console에서 실행합니다.
@@ -274,7 +306,7 @@ copy(mediaGrab.rows.filter(x => ['VIDEO', 'STREAM'].includes(x.type)).map(x => x
 - `img`의 `currentSrc`, `src`, `srcset`과 여러 지연 로딩 속성
 - `picture > source`, SVG의 외부 `image` 주소, 이미지형 `input`, 이미지·영상형 `object`/`embed`
 - CSS 배경·마스크·테두리·목록 이미지와 `::before`/`::after`의 이미지 주소
-- `video`/`source`의 영상 주소와 `video.poster`
+- `video`/`source`의 영상 주소와 `video.poster`, 접근 가능한 Video.js 재생기의 원본 소스
 - 미디어 파일을 직접 가리키는 링크 및 일부 `data-*` 이미지·영상 속성
 - 접근 가능한 iframe과 열린 Shadow DOM
 - Resource Timing에 기록된 미디어 주소
@@ -308,10 +340,13 @@ node --check collect-page-media.js
 node --test tests/media-order.test.cjs
 ```
 
-32개 자동 테스트로 로딩·DOM 순서와 다른 좌표 정렬, 700개 주소의 보존과 정렬, 반응형 이미지 후보, 숨긴 복제본, 재수집, 스크롤, CSS·GIF·영상, Shadow DOM, iframe 좌표·접근 상태와 위치 계산 실패를 확인했습니다.
+39개 자동 테스트로 로딩·DOM 순서와 다른 좌표 정렬, 700개 주소의 보존과 정렬, 반응형 이미지 후보, 숨긴 복제본, 재수집, 스크롤, CSS·GIF·영상, Shadow DOM, iframe 좌표·접근 상태와 위치 계산 실패를 확인했습니다.
 SVG 내부 참조 제외는 절대 주소·CSS 이스케이프·별도의 base URI·iframe 문서에서 검증했으며, 외부 SVG 및 data 이미지 주소는 유지합니다.
 Mercury 이벤트 주소 제외는 네트워크·DOM·CSS 경로와 재수집에서 검증했습니다. 392개 이미지 후보와 CSS GIF 한 개를 보존하면서 이벤트 주소 67개를 분리하는 모의 사례와, 일반 GIF를 fetch/XHR로 수집하는 사례도 포함합니다.
 테스트는 위치·표시 상태를 지정한 모의 DOM에서 수행하며, 실제 브라우저의 렌더링이나 쿠팡 페이지에서 새 정렬 기능을 검증한 기록은 아닙니다.
+Video.js 보완은 DOM에 blob만 있는 재생기의 원본 소스·긴 쿼리 문자열 보존, 선택 소스와 대체 소스 구분, 확장자 없는 HLS·DASH, 기존 재생기 조회, 접근 오류, 지연 로딩 후 재수집, 닫힌 팝업의 주소 보존, iframe 좌표와 오디오 제외를 모의 재생기에서 확인했습니다.
+재생기에서 찾은 원본 MP4 주소로 브라우저 ZIP 다운로드를 진행하고 받은 바이트를 보존하는 사례도 포함합니다.
+쿠팡 리뷰 재생창의 첨부 HTML에서 Video.js 사용을 확인했지만, 현재 브라우저에는 상품 페이지의 사용권한 제한이 표시되어 실제 쿠팡 재생기의 API·원본 주소 수집·영상 다운로드는 직접 검증하지 못했습니다.
 목록 파일 내보내기는 긴 URL의 전체 문자열 보존·순서·선택 주소 필터·Blob을 통한 한 파일의 저장 요청을 모의 환경에서 검증했습니다. 실제 브라우저의 다운로드 UI는 검증하지 않았습니다.
 브라우저 ZIP 기능은 원본 바이트·순번·확장자 보정, OK·HTML·JSON·HTTP 오류·읽을 수 없는 응답 제외, 대상 범위, ZIP 분할, 크기 제한, 요청 시간 제한, 중단·동시 실행 방지와 재생목록 구분을 포함합니다.
 

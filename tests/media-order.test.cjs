@@ -185,6 +185,113 @@ test('CSS, pseudo images, GIF, video and poster receive their host positions', (
   assert.equal(grab.rows.find(row => row.url === url('/inactive.jpg')).visible, false);
 });
 
+test('Video.js wrapper exposes the original signed source behind a native blob URL', () => {
+  const f = fixture();
+  const blob = 'blob:https://shop.example/review-player';
+  const current = { src: '/review/master.m3u8?signature=' + 'x'.repeat(400) + '&expires=123', type: 'application/x-mpegURL' };
+  const alternative = { src: '/review/alternate.mp4', type: 'video/mp4' };
+  const wrapper = f.element('div', { attrs: { id: 'vjs_video_1', class: 'video-js vjs-v7' } });
+  const video = f.element('video', { attrs: { src: blob }, rect: { top: 350, left: 70 } });
+  const player = {
+    currentSource() { assert.equal(this, player); return current; },
+    currentSources() { return [current, alternative]; }
+  };
+  wrapper.player = player;
+  wrapper.append(video);
+  f.doc.body.append(wrapper);
+  const grab = f.run();
+  const row = grab.rows.find(r => r.url === url(current.src));
+  assert.deepEqual([row.type, row.source, row.top, row.left, row.visible, row.temporary],
+    ['STREAM', 'videojs.currentSource', 350, 70, true, false]);
+  assert.equal(grab.rows.find(r => r.url === blob).temporary, true);
+  assert.equal(grab.rows.find(r => r.url === url(alternative.src)).visible, false);
+  assert.equal(grab.rows.filter(r => r.url === url(current.src)).length, 1);
+  assert.ok(grab.getManifest({ visibleOnly: true }).items.some(r => r.url === url(current.src)));
+});
+
+test('Video.js getPlayer reads an existing player without initializing or changing playback', () => {
+  const f = fixture();
+  const video = f.element('video', { currentSrc: 'blob:https://shop.example/playing' });
+  let lookups = 0;
+  const player = {
+    currentSrc() { return '/review/play?id=123&signature=full-value'; },
+    currentType() { return 'video/mp4'; },
+    src() { assert.fail('must not set or retrieve sources through src()'); },
+    play() { assert.fail('must not start playback'); }
+  };
+  const videojs = () => assert.fail('must not initialize a player');
+  videojs.getPlayer = element => { lookups++; assert.equal(element, video); return player; };
+  f.doc.defaultView.videojs = videojs;
+  f.doc.defaultView.fetch = () => assert.fail('must not request a source');
+  f.doc.body.append(video);
+  const grab = f.run();
+  const row = grab.rows.find(r => r.url === url('/review/play?id=123&signature=full-value'));
+  assert.deepEqual([row.type, row.source, row.visible], ['VIDEO', 'videojs.currentSrc', true]);
+  assert.equal(lookups, 1);
+});
+
+test('Video.js MIME types identify extensionless HLS and DASH sources', () => {
+  const f = fixture();
+  for (const [name, mime] of [['hls', 'application/vnd.apple.mpegurl; charset=UTF-8'], ['dash', 'application/dash+xml']]) {
+    const host = f.element('video-js', { rect: { top: name === 'hls' ? 200 : 300 } });
+    host.player = { currentSource: () => ({ src: '/stream/' + name + '?signed=full', type: mime }) };
+    f.doc.body.append(host);
+  }
+  const grab = f.run();
+  assert.deepEqual(Array.from(grab.rows, r => [r.type, r.visible]), [['STREAM', true], ['STREAM', true]]);
+});
+
+test('unavailable player getters preserve native media and other source getters', () => {
+  const f = fixture();
+  const unavailable = f.element('video', { attrs: { src: '/native.mp4' } });
+  Object.defineProperty(unavailable, 'player', { get() { throw new Error('not available'); } });
+  f.doc.defaultView.videojs = { getPlayer() { throw new Error('not available'); } };
+  const remaining = f.element('video');
+  remaining.player = {
+    currentSource() { throw new Error('disposed getter'); },
+    currentSources() { return [{ src: '/still-readable.mp4' }, null, { src: 123 }, 'javascript:alert(1)']; }
+  };
+  f.doc.body.append(unavailable, remaining, f.img('/normal.jpg', 500));
+  const grab = f.run();
+  assert.deepEqual(new Set(urls(grab)), new Set(['/native.mp4', '/still-readable.mp4', '/normal.jpg'].map(url)));
+});
+
+test('rescan captures late player sources and preserves them after the review popup closes', () => {
+  const f = fixture();
+  const popup = f.element('div', { attrs: { class: 'video-js' } });
+  const video = f.element('video', { attrs: { src: 'blob:https://shop.example/first' } });
+  let current = {};
+  popup.player = { currentSource: () => current };
+  popup.append(video);
+  f.doc.body.append(popup);
+  const grab = f.run();
+  assert.equal(grab.rows.filter(r => !r.temporary).length, 0);
+  current = { src: '/review/original.m3u8?token=unshortened', type: 'application/x-mpegURL' };
+  video.currentSrc = 'blob:https://shop.example/reopened';
+  video.attrs.src = video.currentSrc;
+  grab.scan();
+  assert.equal(grab.rows.find(r => r.url === url(current.src)).source, 'videojs.currentSource');
+  f.doc.body.children = f.doc.body.children.filter(el => el !== popup);
+  grab.scan();
+  const row = grab.getManifest().items.find(r => r.url === url(current.src));
+  assert.equal(row.type, 'STREAM');
+  assert.equal(row.top, null);
+});
+
+test('Video.js sources use iframe page coordinates and exclude audio players', () => {
+  const f = fixture(), child = fixture();
+  const video = child.element('video', { rect: { top: 20, left: 30 } });
+  video.player = { currentSource: () => ({ src: '/child.mp4' }) };
+  child.doc.body.append(video);
+  const frame = f.element('iframe', { rect: { top: 500, left: 100, width: 300, height: 200 } });
+  Object.assign(frame, { contentDocument: child.doc, offsetWidth: 300, offsetHeight: 200, clientWidth: 300, clientHeight: 200 });
+  const audio = f.element('div', { attrs: { class: 'video-js vjs-audio' } });
+  audio.player = { isAudio: () => true, currentSource: () => ({ src: '/audio-only.mp4' }) };
+  f.doc.body.append(frame, audio);
+  const grab = f.run();
+  assert.deepEqual(Array.from(grab.rows, r => [r.url, r.top, r.left]), [[url('/child.mp4'), 520, 130]]);
+});
+
 test('open shadow DOM respects host clipping and host opacity', () => {
   const f = fixture();
   const host = f.element('div', { rect: { top: 20, left: 20, width: 100, height: 100 },
@@ -496,6 +603,29 @@ test('browser ZIP preserves page order and GIF bytes and corrects misleading ext
     assert.equal(options.mode, 'cors');
     assert.equal(options.credentials, 'same-origin');
   }
+});
+
+test('browser ZIP downloads the original Video.js MP4 source instead of its native blob', async () => {
+  const source = url('/review/original.mp4?signature=full-value');
+  const bytes = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypmp42'),
+    Buffer.alloc(4), Buffer.from('mp42isom'), Buffer.from([0, 0, 0, 8]), Buffer.from('mdat')]);
+  const blob = 'blob:https://shop.example/media-source';
+  const f = downloadFixture({
+    [source]: new Response(bytes, { headers: { 'Content-Type': 'video/mp4' } }),
+    [blob]: new TypeError('MediaSource cannot be fetched as a file')
+  });
+  const wrapper = f.element('div', { attrs: { class: 'video-js vjs-v7' } });
+  wrapper.player = { currentSource: () => ({ src: source, type: 'video/mp4' }) };
+  wrapper.append(f.element('video', { attrs: { src: blob } }));
+  f.doc.body.append(wrapper);
+  const grab = f.run(), row = grab.rows.find(r => r.url === source);
+  const result = await grab.download({ start: row.order, end: row.order });
+  assert.equal(result.results[0].status, 'packed');
+  assert.equal(result.results[0].source, 'videojs.currentSource');
+  assert.equal(result.results[0].filename, '0001.mp4');
+  assert.deepEqual(f.requests.map(r => r.href), [source]);
+  const files = await zipFiles(f.blobs.get(result.archives[0].url));
+  assert.deepEqual(files.get('0001.mp4'), bytes);
 });
 
 test('browser ZIP rejects OK, HTML, JSON, HTTP errors and unreadable responses without saving false media', async () => {

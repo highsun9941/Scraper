@@ -143,6 +143,40 @@
       add(href, "IMAGE", base, source, position, visible, element);
     }
   };
+  // Video.js는 <video>.currentSrc에 blob을 놓고 원본 소스를 별도로 보관할 수 있습니다.
+  // 이미 있는 재생기만 읽습니다. videojs() 호출로 재생기를 만들거나 src를 바꾸지 않습니다.
+  const videojsSources = (el, win, ctx, base, element) => {
+    if (!["video", "video-js"].includes(el.localName) &&
+        !String(el.getAttribute("class") || "").split(/\s+/).includes("video-js")) return;
+    const readable = p => p && ["currentSource", "currentSources", "currentSrc"].some(name => typeof p[name] === "function");
+    let player;
+    try { if (readable(el.player)) player = el.player; } catch {}
+    if (!player) {
+      try { const existing = win.videojs?.getPlayer?.(el); if (readable(existing)) player = existing; } catch {}
+    }
+    if (!player) return;
+    try { if (typeof player.isAudio === "function" && player.isAudio()) return; } catch { return; }
+    const read = name => { try { return typeof player[name] === "function" ? player[name]() : null; } catch { return null; } };
+    const sources = [];
+    const collect = (value, method) => {
+      const source = typeof value === "string" ? { src: value } : value;
+      if (source && typeof source.src === "string") sources.push({ ...source, method });
+    };
+    collect(read("currentSource"), "currentSource");
+    if (!sources.some(source => source.src)) collect({ src: read("currentSrc"), type: read("currentType") }, "currentSrc");
+    const selectedSrc = sources.find(source => source.src)?.src;
+    const alternatives = read("currentSources");
+    if (Array.isArray(alternatives)) for (const source of alternatives) collect(source, "currentSources");
+    const media = el.localName === "video" ? el : el.querySelector("video") || el;
+    const position = locate(media, ctx), mediaBase = media.baseURI || base;
+    const selected = absolute(selectedSrc, mediaBase);
+    for (const source of sources) {
+      const mime = String(source.type || "").split(";")[0].trim();
+      const kind = /^(?:application\/(?:vnd\.apple\.mpegurl|x-mpegurl|dash\+xml)|audio\/(?:x-)?mpegurl)$/i.test(mime) ? "STREAM" : "VIDEO";
+      add(source.src, kind, mediaBase, `videojs.${source.method}`, position,
+        absolute(source.src, mediaBase) === selected, element);
+    }
+  };
   const walk = (root, seen, ctx) => {
     if (!root || seen.has(root)) return;
     seen.add(root);
@@ -189,6 +223,7 @@
       }
       if (tag === "image") emit(el.getAttribute("href") || el.getAttribute("xlink:href"), "IMAGE", "svg.image");
       if (tag === "video") emit(el.getAttribute("poster"), "IMAGE", "video.poster", true);
+      try { videojsSources(el, win, ctx, base, element); } catch {}
       if (["a", "link"].includes(tag)) add(el.getAttribute("href"), "", base, `${tag}.href`);
       for (const a of ["data-bg", "data-background", "data-background-image", "data-image", "data-image-src", "data-video-src", "data-video-url", "data-poster"]) {
         const value = el.getAttribute(a);
