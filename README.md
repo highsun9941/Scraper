@@ -7,6 +7,7 @@
 Windows 기본 PowerShell로 목록에 있는 파일을 일괄 다운로드할 수 있습니다. **추가 설치는 필요하지 않습니다.**
 브라우저에서 읽을 수 있는 원본 파일은 콘솔 명령으로 ZIP에 묶어 다운로드하는 방식도 지원합니다.
 Python 다운로드 도구는 선택 사항입니다.
+유튜브 임베드는 `EMBED`로 기록합니다. 리뷰 재생창의 동적 영상 주소는 스크립트 실행 후 자동 감시합니다.
 
 ## 윈도우에서 실행하기
 
@@ -19,6 +20,7 @@ Python 다운로드 도구는 선택 사항입니다.
 
 `collect-page-media.js`는 상품 페이지 안에서 실행하는 코드입니다. 실행할 페이지의 `window`와 `document`를 사용합니다.
 한 번 실행하면 `window.mediaGrab`에 결과와 재수집 함수가 생깁니다.
+리뷰 영상은 **코드를 먼저 실행하고 나서 각 영상을 재생**하세요. 팝업을 닫아도 발견한 주소는 보존합니다.
 
 ## Windows PowerShell로 일괄 다운로드하기 (추가 설치 없음)
 
@@ -50,7 +52,7 @@ GIF·동영상은 받은 바이트 그대로 저장합니다. 매번 새 결과 
 | `download-report.csv` | 순번·저장 파일명·상태·HTTP 상태·원본 URL·오류 내용 |
 | `failed.csv` | 실패하거나 건너뛴 주소와 사유. Excel에서 열 수 있는 UTF-8 BOM 형식 |
 
-`saved`는 미디어 저장, `playlist`는 재생목록만 저장, `failed`는 다운로드·형식 확인 실패, `skipped`는 지원하지 않는 주소 등입니다.
+`saved`는 미디어 저장, `playlist`는 재생목록만 저장, `link`는 외부 영상 바로가기 저장, `failed`는 다운로드·형식 확인 실패, `skipped`는 지원하지 않는 주소 등입니다.
 URL 확장자나 MIME 표기만 믿지 않고 실제 파일 앞부분을 확인하므로 `OK`·HTML·JSON 오류 응답은 미디어로 저장하지 않습니다.
 이 검사는 파일 전체의 재생 가능성이나 실제 애니메이션 여부까지 확인하는 기능은 아닙니다.
 
@@ -81,6 +83,72 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\download-media.ps1" -
 - 지원하는 형식의 `data:` 주소도 저장합니다. 브라우저 세션에 의존하는 `blob:` 주소는 건너뜁니다.
 - `.m3u8`·`.mpd`는 재생목록만 저장합니다. 영상 조각 병합·DRM 처리는 지원하지 않습니다.
 - 서버 접속 제한과 만료된 주소는 실패 기록에 남기고 다음 파일로 진행합니다. 일부 주소가 실패해도 나머지 다운로드는 계속합니다.
+
+## 유튜브 임베드와 클릭해야 나타나는 리뷰 영상
+
+유튜브 iframe의 내부 문서를 읽을 수 없어도 부모 페이지의 `src`, `data-src` 등을 읽어 영상 ID와 시청 주소를 수집합니다.
+`type: "EMBED"`, `provider: "youtube"`, `videoId`, `embedUrl`을 기록하며 같은 영상 ID는 한 번만 수집합니다.
+재생 버튼의 `<cued-overlay>` HTML만으로는 영상 ID를 알 수 없으므로 iframe 주소가 필요합니다.
+
+쿠팡 리뷰의 `origin_thumbnail.0000002.jpg`는 **미리보기 이미지**입니다.
+이 이미지를 MP4로 이름만 바꾸거나 경로에서 영상 URL을 추측하지 않습니다.
+대신 썸네일만 확인된 리뷰를 `pendingVideos`로 알리고, 원본 주소가 확인되면 목록에서 제거합니다.
+
+1. 상품 상세를 펼치고 최신 `collect-page-media.js` 전체를 콘솔에서 실행합니다. 영상 감시는 자동으로 시작합니다.
+2. 영상 리뷰를 하나씩 눌러 실제 재생합니다. 재생기·DOM·네트워크에서 원본 주소를 읽으며, 팝업을 닫아도 기록을 보존합니다.
+3. 다음 명령으로 결과를 확인하고 목록을 내보냅니다.
+
+   ```js
+   mediaGrab.scan()
+   console.table(mediaGrab.videos)        // 원본 영상, 재생목록, 유튜브 시청 주소
+   console.table(mediaGrab.pendingVideos) // 썸네일만 확인된 리뷰
+   mediaGrab.export()
+   ```
+
+`export()`와 `download()`는 처리 전에 현재 페이지를 다시 수집합니다.
+`visibleOnly: true`는 닫힌 팝업의 영상 주소를 제외할 수 있으므로 리뷰 영상 수집에는 기본 옵션을 사용하세요.
+
+| 명령 | 동작 |
+|---|---|
+| `mediaGrab.embeds` | 유튜브 임베드에서 확인한 시청 주소 |
+| `mediaGrab.videos` | 임시 blob을 제외한 `VIDEO`, `STREAM`, `EMBED` |
+| `mediaGrab.pendingVideos` | 원본 주소를 확인하지 못한 쿠팡 리뷰 썸네일 |
+| `mediaGrab.watching` | 자동 영상 감시 상태 |
+| `mediaGrab.stopWatching()` | 이벤트·DOM·네트워크 관찰과 재생기 폴링 종료 |
+| `mediaGrab.watch()` | 감시 재시작. 새 네트워크 요청이나 자동 클릭은 하지 않음 |
+
+유튜브 시청 주소는 영상 파일이 아닙니다. 브라우저 ZIP과 기존 Python·PowerShell 도구는
+번호가 붙은 `.url` 바로가기와 `link` 상태를 남깁니다. 영상 파일 저장에는 아래 도구를 사용합니다.
+
+## 선택: 유튜브·리뷰 영상 파일 다운로드
+
+`download-videos.py`는 JSON 목록의 `VIDEO`, `STREAM`, `EMBED`만 골라 **yt-dlp**로 다운로드합니다.
+이미지와 미확인 리뷰 썸네일은 영상 주소로 취급하지 않습니다.
+
+1. Python 3.10 이상을 준비하고 명령 프롬프트에서 다음 설치 명령을 한 번 실행합니다.
+
+   ```bat
+   py -3 -m pip install -U "yt-dlp[default]"
+   ```
+
+2. 저장소의 `download-videos.py`와 `download-videos.cmd`를 같은 폴더에 둡니다.
+3. 리뷰를 재생한 뒤 다시 내보낸 `media-manifest.json`을 **`download-videos.cmd` 위로 드래그**합니다.
+   또는 명령 프롬프트에서 실행합니다.
+
+   ```bat
+   py -3 download-videos.py media-manifest.json
+   ```
+
+결과는 목록 파일 옆의 `video-output/날짜-시간-식별자/`에 저장합니다.
+영상 이름은 수집 순번을 사용하고, `video-report.json`에 처리 결과 및 미확인 리뷰 개수를 기록합니다.
+미확인 리뷰가 남아 있거나 다운로드가 실패하면 종료 코드는 `2`입니다.
+
+기본적으로 음성과 영상이 들어 있는 단일 형식을 선택합니다(`b[ext=mp4]/b`).
+항상 최고 해상도나 MP4를 보장하지 않으며, 제공되는 형식에 따라 확장자가 달라질 수 있습니다.
+YouTube 지원은 최신 yt-dlp와 지원되는 JavaScript 실행기(예: Deno 또는 Node.js)에 의존합니다.
+설치된 Node.js가 있으면 `--js-runtimes node`를 전달합니다.
+고화질 분리 트랙 병합에는 FFmpeg가 필요할 수 있습니다. [yt-dlp 공식 설치·의존성 안내](https://github.com/yt-dlp/yt-dlp#installation)를 참고하세요.
+브라우저 쿠키를 읽거나 로그인 제한을 통과하는 기능은 없으며, 서명 주소가 만료되면 재생 후 목록을 다시 내보내세요.
 
 ## 리뷰 영상이 blob 주소로만 잡힐 때
 
@@ -136,7 +204,8 @@ mediaGrab.download();
 
 각 ZIP에는 해당 ZIP에 대응하는 `download-report.json`, `download-report.csv`, `failed.csv`도 들어 있습니다.
 `packed`는 원본 파일을 읽어 ZIP에 넣었다는 의미이며, 브라우저가 사용자 디스크에 저장한 사실까지 확인하는 값은 아닙니다.
-`playlist`는 재생목록만 포함, `failed`는 읽기·형식 확인 실패, `skipped`는 중단으로 처리하지 않은 주소입니다.
+`playlist`는 재생목록만 포함, `link`는 외부 영상의 `.url` 바로가기만 포함,
+`failed`는 읽기·형식 확인 실패, `skipped`는 중단으로 처리하지 않은 주소입니다.
 전체 결과는 `mediaGrab.lastDownload`에서 확인합니다.
 
 | 명령 | 동작 |
@@ -219,7 +288,7 @@ py -3 download-media.py "C:\Users\사용자\Downloads\media-manifest.json"
 | `download-report.json` | 같은 결과의 JSON 기록 |
 | `failed.csv` | 실패했거나 건너뛴 주소와 사유. Excel에서 열 수 있는 UTF-8 BOM 형식 |
 
-상태는 `saved`(미디어 저장), `playlist`(재생목록만 저장), `failed`(다운로드·형식 확인 실패), `skipped`(지원하지 않는 주소 등)입니다.
+상태는 `saved`(미디어 저장), `playlist`(재생목록만 저장), `link`(외부 영상 바로가기 저장), `failed`(다운로드·형식 확인 실패), `skipped`(지원하지 않는 주소 등)입니다.
 일부 주소가 실패해도 나머지 다운로드는 계속됩니다. 종료 코드는 모두 처리하면 0, 실패·건너뜀이 있으면 2, 시작하지 못하면 1입니다.
 
 다운로드 도구는 URL 확장자나 `Content-Type`만 믿지 않고 받은 파일 앞부분의 형식 표식을 확인합니다.
@@ -322,6 +391,7 @@ CSS의 `url(#id)`와 현재 문서 URL에 `#id`가 붙은 주소는 페이지 �
 | `GIF` | `.gif` 확장자 또는 명시적인 GIF MIME 표기로 판단한 주소 |
 | `VIDEO` | 영상 요소나 영상 확장자로 판단한 주소 |
 | `STREAM` | `.m3u8` / `.mpd` 스트리밍 목록 주소 |
+| `EMBED` | 외부 영상 플레이어의 시청 주소. 직접 영상 파일은 아님 |
 
 | 추가 필드 | 의미 |
 |---|---|
@@ -330,6 +400,9 @@ CSS의 `url(#id)`와 현재 문서 URL에 `#id`가 붙은 주소는 페이지 �
 | `visible` | 표시되는 요소의 선택 주소 또는 계산된 CSS 이미지 주소인지 여부 |
 | `source` | 주소를 발견한 요소 속성이나 CSS, 네트워크 등의 경로 |
 | `temporary` | `true`이면 페이지 세션에 의존하는 `blob:` 임시 주소 |
+| `provider`, `videoId`, `embedUrl` | 외부 영상의 제공자·영상 ID·발견한 임베드 주소. `EMBED`에만 포함 |
+
+내보낸 JSON의 `pendingVideos`는 썸네일만 확인된 리뷰이며, `blockedFrames`는 내부 문서 접근이 제한된 iframe입니다.
 
 ## 수집·다운로드 기능 검증
 
@@ -340,7 +413,9 @@ node --check collect-page-media.js
 node --test tests/media-order.test.cjs
 ```
 
-39개 자동 테스트로 로딩·DOM 순서와 다른 좌표 정렬, 700개 주소의 보존과 정렬, 반응형 이미지 후보, 숨긴 복제본, 재수집, 스크롤, CSS·GIF·영상, Shadow DOM, iframe 좌표·접근 상태와 위치 계산 실패를 확인했습니다.
+수집·ZIP 자동 테스트로 로딩·DOM 순서와 다른 좌표 정렬, 700개 주소의 보존과 정렬, 반응형 이미지 후보, 숨긴 복제본, 재수집, 스크롤, CSS·GIF·영상, Shadow DOM, iframe 좌표·접근 상태와 위치 계산 실패를 확인했습니다.
+유튜브 iframe의 교차 출처·지연 로딩·영상 ID 중복 제거·유사 도메인 제외, 리뷰 썸네일의 미수집 진단, 자동 이벤트·DOM·네트워크 감시, 팝업 제거 후 보존, 감시기 해제와 외부 영상 `.url` 저장도 모의 환경에서 검증합니다.
+영상 전용 다운로드 도구는 URL 분류, 순번·서명 보존, subprocess 인자 전달, 결과 파일 확인, 실패 기록을 검증합니다. 실제 YouTube 다운로드는 이 환경에서 검증하지 못했습니다.
 SVG 내부 참조 제외는 절대 주소·CSS 이스케이프·별도의 base URI·iframe 문서에서 검증했으며, 외부 SVG 및 data 이미지 주소는 유지합니다.
 Mercury 이벤트 주소 제외는 네트워크·DOM·CSS 경로와 재수집에서 검증했습니다. 392개 이미지 후보와 CSS GIF 한 개를 보존하면서 이벤트 주소 67개를 분리하는 모의 사례와, 일반 GIF를 fetch/XHR로 수집하는 사례도 포함합니다.
 테스트는 위치·표시 상태를 지정한 모의 DOM에서 수행하며, 실제 브라우저의 렌더링이나 쿠팡 페이지에서 새 정렬 기능을 검증한 기록은 아닙니다.
@@ -366,7 +441,7 @@ Python 다운로드 도구 테스트는 임시 폴더에 결과를 저장하며,
 python -m unittest discover -s tests -p test_downloader.py -v
 ```
 
-11개 테스트로 로컬 HTTP 서버에서의 실제 다운로드, GIF 원본 바이트 보존, 확장자 보정, OK·HTML·JSON 제외, 403/404, 중간에 끊긴 응답, 리다이렉트, Referer, 재생목록, data/blob URL, 동시 다운로드 후의 순번, 실패 보고서와 기존 폴더 보존을 확인했습니다.
+12개 테스트로 로컬 HTTP 서버에서의 실제 다운로드, GIF 원본 바이트 보존, 확장자 보정, OK·HTML·JSON 제외, 403/404, 중간에 끊긴 응답, 리다이렉트, Referer, 재생목록, data/blob URL, 동시 다운로드 후의 순번, 실패 보고서와 기존 폴더 보존 및 유튜브 시청 주소의 바로가기 저장을 확인했습니다.
 다운로드 로직과 명령줄 실행은 Linux의 Python 3.12에서 검증했습니다. Windows용 `.cmd` 실행 파일은 코드를 검토했으며, Windows에서 직접 실행하지는 못했습니다.
 
 PowerShell 다운로드 도구는 로컬 HTTP 서버와 10개 통합 테스트로 실제 파일 바이트·순번·확장자 보정, 리다이렉트·Referer, 보고서 재사용·실패 항목 재시도, CSV·텍스트 목록, data 주소·큰 data 주소, 오류 응답·재생목록 구분, 크기 제한, 끊긴 응답, 요청·본문 읽기 시간 제한과 기존 폴더 보존을 확인했습니다.

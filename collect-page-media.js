@@ -1,5 +1,7 @@
 (() => {
-  const found = new Map(), excluded = new Map(), blockedFrames = new Set();
+  // 스니펫을 다시 실행하면 이전 감시기를 해제합니다.
+  try { window.mediaGrab?.stopWatching?.(); } catch {}
+  const found = new Map(), excluded = new Map(), blockedFrames = new Set(), reviewPreviews = new Map();
   let styles, layouts, elementOrder;
   const guess = u => {
     if (/\.gif(?:$|[?#])|^data:image\/gif[;,]/i.test(u)) return "GIF";
@@ -63,7 +65,7 @@
     layouts.set(el, result);
     return result;
   };
-  const add = (raw, kind, base, source, position = null, visible = false, element = Infinity) => {
+  const add = (raw, kind, base, source, position = null, visible = false, element = Infinity, metadata = null) => {
     const href = absolute(raw, base);
     if (!href) return;
     try {
@@ -88,6 +90,7 @@
       } else if (row.type === "IMAGE" && type !== "IMAGE") {
         Object.assign(row, { type, source });
       }
+      if (metadata) Object.assign(row, metadata);
       visible = Boolean(position && visible);
       // 같은 URL은 실제 표시되는 첫 위치를 우선합니다. 숨긴 복제본은 뒤로 둡니다.
       if (position && ((!row.visible && visible) ||
@@ -96,6 +99,43 @@
         Object.assign(row, { position, visible, element, source });
       }
     } catch {}
+  };
+  const youtube = (raw, base) => {
+    try {
+      const u = new URL(raw, base), host = u.hostname.toLowerCase();
+      if (!/^https?:$/.test(u.protocol)) return null;
+      let id = "";
+      if (host === "youtu.be" || host === "www.youtu.be") id = u.pathname.split("/")[1];
+      else if (/^(?:(?:www|m)\.)?youtube\.com$/.test(host) || /^(?:www\.)?youtube-nocookie\.com$/.test(host)) {
+        id = u.pathname === "/watch" ? u.searchParams.get("v") :
+          u.pathname.match(/^\/(?:embed|v|shorts|live)\/([^/]+)\/?$/)?.[1];
+      }
+      if (!/^[\w-]{11}$/.test(id || "") || ["videoseries", "live_stream"].includes(id)) return null;
+      return { provider: "youtube", videoId: id, embedUrl: u.href,
+        url: `https://www.youtube.com/watch?v=${id}` };
+    } catch { return null; }
+  };
+  const addEmbed = (raw, base, source, position = null, visible = false, element = Infinity) => {
+    const info = youtube(raw, base);
+    if (info) add(info.url, "EMBED", base, source, position, visible, element,
+      { provider: info.provider, videoId: info.videoId, embedUrl: info.embedUrl });
+  };
+  const addResource = (r, base) => {
+    const kind = r.initiatorType === "img" ? "IMAGE" : r.initiatorType === "video" ? "VIDEO" : "";
+    add(r.name, kind, base, "network");
+    if (r.initiatorType === "iframe") addEmbed(r.name, base, "network.iframe");
+  };
+  const reviewKey = (raw, base) => {
+    try {
+      const u = new URL(raw, base);
+      return u.hostname === "video.coupangcdn.com" &&
+        /^\/cloud\/PRODUCTREVIEW\/.+\/transcode\/origin_thumbnail\.\d+\.jpg$/i.test(u.pathname) ?
+        u.origin + u.pathname.slice(0, u.pathname.indexOf("/transcode/") + 1) : null;
+    } catch { return null; }
+  };
+  const rememberPreview = (raw, base) => {
+    const key = reviewKey(raw, base), href = absolute(raw, base);
+    if (key && href && !reviewPreviews.has(key)) reviewPreviews.set(key, href);
   };
   const srcset = (text, kind, base, source, position, primary, element) => {
     let i = 0;
@@ -177,20 +217,120 @@
         absolute(source.src, mediaBase) === selected, element);
     }
   };
+  // 동적 팝업은 닫히기 전에 읽습니다. 재생을 시작하거나 src를 변경하지 않습니다.
+  const captureMedia = (el, ctx, element = Infinity) => {
+    if (!el?.localName) return;
+    const tag = el.localName, base = el.baseURI || el.ownerDocument?.baseURI;
+    const win = el.ownerDocument?.defaultView;
+    if (!win) return;
+    const previewSources = tag === "img" ? [el.currentSrc, ...["src", "data-src", "data-original"].map(a => el.getAttribute(a))] : [];
+    if (!["video", "video-js", "iframe", "object", "embed"].includes(tag) &&
+        !String(el.getAttribute("class") || "").split(/\s+/).includes("video-js") &&
+        !previewSources.some(raw => reviewKey(raw, base))) return;
+    const position = el.isConnected === false ? null : locate(el, ctx);
+    if (["iframe", "object", "embed"].includes(tag)) {
+      const primary = absolute(el.src || el.getAttribute("src") || el.getAttribute("data"), base);
+      for (const attr of ["src", "data", "data-src", "data-lazy-src", "data-original-src"]) {
+        const raw = el.getAttribute(attr);
+        if (raw) addEmbed(raw, base, `${tag}.${attr}`, position,
+          absolute(raw, base) === primary, element);
+      }
+    }
+    if (tag === "img") {
+      for (const raw of previewSources) {
+        if (reviewKey(raw, base)) {
+          rememberPreview(raw, base);
+          add(raw, "IMAGE", base, "review.thumbnail", position,
+            absolute(raw, base) === absolute(el.currentSrc || el.getAttribute("src"), base), element);
+        }
+      }
+    }
+    if (tag === "video") {
+      const primary = absolute(el.currentSrc || el.getAttribute("src"), base);
+      add(el.currentSrc, "VIDEO", base, "video.currentSrc", position, true, element);
+      for (const attr of ["src", "data-src", "data-video-src", "data-video-url"]) {
+        const raw = el.getAttribute(attr);
+        add(raw, "VIDEO", base, `video.${attr}`, position, absolute(raw, base) === primary, element);
+      }
+      for (const child of el.querySelectorAll("source")) {
+        if (child.localName === "source") add(child.getAttribute("src"), "VIDEO", child.baseURI || base,
+          "source.src", position, absolute(child.getAttribute("src"), base) === primary, element);
+      }
+      add(el.getAttribute("poster"), "IMAGE", base, "video.poster", position, true, element);
+    }
+    try { videojsSources(el, win, ctx, base, element); } catch {}
+  };
+  let watching = false, pollTimer = null;
+  let watchedRoots = new Map(), watchedWindows = new Map();
+  const cleanups = new Set();
+  const captureTree = (root, ctx) => {
+    styles = new WeakMap(); layouts = new WeakMap();
+    if ((root?.ownerDocument || root) === document) {
+      ctx = { ...ctx, x: Number(window.scrollX) || 0, y: Number(window.scrollY) || 0 };
+    }
+    captureMedia(root, ctx);
+    for (const el of root?.querySelectorAll?.("video, video-js, .video-js, iframe, object, embed, img") || []) {
+      captureMedia(el, ctx);
+      if (el.shadowRoot) captureTree(el.shadowRoot, ctx);
+    }
+  };
+  const observeRoot = (root, ctx) => {
+    if (!watching) return;
+    if (watchedRoots.has(root)) { watchedRoots.set(root, ctx); return; }
+    watchedRoots.set(root, ctx);
+    const win = (root.ownerDocument || root).defaultView;
+    if (!win) return;
+    const event = e => {
+      if (!watching) return;
+      captureTree(e.target, watchedRoots.get(root) || ctx);
+      if (e.target?.localName === "iframe") window.mediaGrab.scan({ quiet: true });
+    };
+    for (const name of ["load", "loadstart", "loadedmetadata", "loadeddata", "canplay", "play"]) {
+      root.addEventListener?.(name, event, true);
+      cleanups.add(() => root.removeEventListener?.(name, event, true));
+    }
+    try {
+      if (typeof win.MutationObserver === "function") {
+        const observer = new win.MutationObserver(records => {
+          if (!watching) return;
+          const context = watchedRoots.get(root) || ctx;
+          for (const record of records) {
+            captureTree(record.target, context);
+            for (const node of [...(record.addedNodes || []), ...(record.removedNodes || [])]) {
+              captureTree(node, context);
+              if (node.shadowRoot) observeRoot(node.shadowRoot, context);
+            }
+          }
+        });
+        observer.observe(root, { childList: true, subtree: true, attributes: true,
+          attributeFilter: ["src", "data", "data-src", "data-lazy-src", "data-original-src", "poster", "data-video-src", "data-video-url"] });
+        cleanups.add(() => observer.disconnect());
+      }
+    } catch {}
+    if (watchedWindows.has(win)) return;
+    watchedWindows.set(win, true);
+    try {
+      if (typeof win.PerformanceObserver === "function") {
+        const observer = new win.PerformanceObserver(list => {
+          if (watching) for (const resource of list.getEntries()) addResource(resource, (root.ownerDocument || root).baseURI);
+        });
+        observer.observe({ type: "resource", buffered: true });
+        cleanups.add(() => observer.disconnect());
+      }
+    } catch {}
+  };
   const walk = (root, seen, ctx) => {
     if (!root || seen.has(root)) return;
     seen.add(root);
     const doc = root.ownerDocument || root, win = doc.defaultView;
     if (!win) return;
+    observeRoot(root, ctx);
     const documentURL = doc.URL || doc.location?.href || win.location?.href || doc.baseURI;
     if (!seen.has(win)) {
       seen.add(win);
       let resources = [];
       try { resources = win.performance?.getEntriesByType?.("resource") || []; } catch {}
-      for (const r of resources) {
-        const kind = r.initiatorType === "img" ? "IMAGE" : r.initiatorType === "video" ? "VIDEO" : "";
-        add(r.name, kind, doc.baseURI, "network");
-      }
+      for (const r of resources) addResource(r, doc.baseURI);
     }
     for (const el of root.querySelectorAll("*")) {
       const element = elementOrder++, tag = el.localName, parent = el.parentElement?.localName;
@@ -223,7 +363,7 @@
       }
       if (tag === "image") emit(el.getAttribute("href") || el.getAttribute("xlink:href"), "IMAGE", "svg.image");
       if (tag === "video") emit(el.getAttribute("poster"), "IMAGE", "video.poster", true);
-      try { videojsSources(el, win, ctx, base, element); } catch {}
+      captureMedia(el, ctx, element);
       if (["a", "link"].includes(tag)) add(el.getAttribute("href"), "", base, `${tag}.href`);
       for (const a of ["data-bg", "data-background", "data-background-image", "data-image", "data-image-src", "data-video-src", "data-video-url", "data-poster"]) {
         const value = el.getAttribute(a);
@@ -282,7 +422,8 @@
     return a.discovery - b.discovery;
   }).map((r, i) => ({
     order: i + 1, type: r.type, url: r.url, source: r.source, temporary: r.temporary,
-    top: r.position?.top ?? null, left: r.position?.left ?? null, visible: r.visible
+    top: r.position?.top ?? null, left: r.position?.left ?? null, visible: r.visible,
+    ...(r.provider ? { provider: r.provider, videoId: r.videoId, embedUrl: r.embedUrl } : {})
   }));
   // 외부 라이브러리 없이 ZIP STORE를 만듭니다. 원본 미디어를 재인코딩하지 않습니다.
   const crcTable = Uint32Array.from({ length: 256 }, (_, n) => {
@@ -415,6 +556,39 @@
     get excludedRows() { return [...excluded.values()].map(r => ({ ...r })); },
     get excludedUrls() { return [...excluded.keys()]; },
     get blockedFrames() { return [...blockedFrames]; },
+    get embeds() { return this.rows.filter(r => r.type === "EMBED"); },
+    get videos() { return this.rows.filter(r => ["VIDEO", "STREAM", "EMBED"].includes(r.type) && !r.temporary); },
+    get pendingVideos() {
+      return [...reviewPreviews].filter(([key]) => ![...found.values()].some(row =>
+        ["VIDEO", "STREAM"].includes(row.type) && !row.temporary && row.url.startsWith(key)))
+        .map(([, thumbnailUrl]) => {
+          const row = found.get(thumbnailUrl);
+          return { thumbnailUrl, top: row?.position?.top ?? null, left: row?.position?.left ?? null,
+            visible: row?.visible || false, message: "썸네일만 확인됨. 리뷰 영상을 재생해 원본 주소를 수집하세요." };
+        });
+    },
+    get watching() { return watching; },
+    watch({ intervalMs = 1000, quiet = true } = {}) {
+      if (!Number.isFinite(intervalMs) || intervalMs < 250 || intervalMs > 60000) throw new Error("intervalMs는 250~60000이어야 합니다.");
+      this.stopWatching(); watching = true;
+      this.scan({ quiet });
+      if (typeof window.setInterval === "function") pollTimer = window.setInterval(() => {
+        // 재생기 API가 DOM 변경 없이 원본 소스를 뒤늦게 설정하는 경우를 보완합니다.
+        for (const [root, ctx] of watchedRoots) {
+          try { captureTree(root, ctx); } catch {}
+        }
+      }, intervalMs);
+      console.log("영상 감시 시작: 리뷰 영상을 하나씩 재생하세요. 종료: mediaGrab.stopWatching()");
+      return { watching, intervalMs };
+    },
+    stopWatching() {
+      watching = false;
+      if (pollTimer !== null) window.clearInterval?.(pollTimer);
+      pollTimer = null;
+      for (const cleanup of cleanups) { try { cleanup(); } catch {} }
+      cleanups.clear(); watchedRoots = new Map(); watchedWindows = new Map();
+      return { watching: false };
+    },
     get lastDownload() { return downloadReport; },
     clearDownloads() {
       if (downloadController) throw new Error("다운로드 중에는 결과를 해제할 수 없습니다.");
@@ -431,6 +605,7 @@
     async download({ visibleOnly = false, start = 1, end = Infinity, maxFileMB = 256,
         maxZipMB = 256, timeoutMs = 30000, credentials = "same-origin" } = {}) {
       if (downloadController) throw new Error("이미 다운로드 중입니다. 중단하려면 mediaGrab.stopDownload()를 실행하세요.");
+      this.scan({ quiet: true });
       if (![maxFileMB, maxZipMB].every(x => Number.isFinite(x) && x > 0 && x <= 1024) ||
           !Number.isFinite(timeoutMs) || timeoutMs <= 0 || !Number.isInteger(start) || start < 1 ||
           !(end === Infinity || Number.isInteger(end) && end >= start) ||
@@ -465,7 +640,14 @@
         for (const [i, row] of rows.entries()) {
           const result = { ...row, status: "failed", filename: "", bytes: 0, httpStatus: "", contentType: "", message: "" };
           if (signal.aborted) Object.assign(result, { status: "skipped", message: "사용자가 중단했습니다." });
-          else {
+          else if (row.type === "EMBED") {
+            const filename = `${String(row.order).padStart(width, "0")}.url`;
+            const link = textEntry(filename, `[InternetShortcut]\r\nURL=${row.url}\r\n`);
+            if (entries.length && partBytes + link.size > zipLimit) flush();
+            entries.push(link); partBytes += link.size;
+            Object.assign(result, { status: "link", filename, bytes: link.size,
+              message: "유튜브 영상 페이지 링크를 저장했습니다. 영상 파일은 download-videos.py로 다운로드하세요." });
+          } else {
             try {
               const data = await readMedia(row.url, options, signal);
               if (entries.length && (partBytes + data.size > zipLimit || entries.length >= 10000)) flush();
@@ -486,19 +668,24 @@
         downloadReport.cancelled = signal.aborted; downloadReport.finishedAt = new Date().toISOString();
         const packed = downloadReport.results.filter(row => row.status === "packed").length;
         const playlists = downloadReport.results.filter(row => row.status === "playlist").length;
-        console.log(`완료: 미디어 ${packed}개 / 재생목록 ${playlists}개 / 실패·건너뜀 ${rows.length - packed - playlists}개 / ZIP ${downloadReport.archives.length}개`);
+        const links = downloadReport.results.filter(row => row.status === "link").length;
+        console.log(`완료: 미디어 ${packed}개 / 재생목록 ${playlists}개 / 외부 영상 링크 ${links}개 / 실패·건너뜀 ${rows.length - packed - playlists - links}개 / ZIP ${downloadReport.archives.length}개`);
+        if (this.pendingVideos.length) console.log(`아직 썸네일만 확인된 리뷰 영상 ${this.pendingVideos.length}개: mediaGrab.pendingVideos`);
         console.log("상세 결과: mediaGrab.lastDownload. ZIP 안의 failed.csv에서 실패 주소를 확인하세요.");
         return downloadReport;
       } finally { downloadController = null; }
     },
     getManifest({ visibleOnly = false } = {}) {
+      this.scan({ quiet: true });
       return {
         schema: "media-grab/1",
         pageUrl: document.URL || document.location?.href || document.baseURI,
         title: document.title || "",
         exportedAt: new Date().toISOString(),
         visibleOnly: Boolean(visibleOnly),
-        items: visibleOnly ? this.visibleRows : this.rows
+        items: visibleOnly ? this.visibleRows : this.rows,
+        blockedFrames: this.blockedFrames,
+        pendingVideos: this.pendingVideos
       };
     },
     export(options = {}) {
@@ -517,7 +704,7 @@
       console.log(`주소 ${manifest.items.length}개의 목록 파일 저장을 요청했습니다: media-manifest.json`);
       return { filename: "media-manifest.json", count: manifest.items.length, visibleOnly: manifest.visibleOnly };
     },
-    scan() {
+    scan({ quiet = false } = {}) {
       styles = new WeakMap(); layouts = new WeakMap(); elementOrder = 0;
       blockedFrames.clear();
       for (const row of found.values()) Object.assign(row, { position: null, visible: false, element: Infinity });
@@ -528,6 +715,7 @@
         sx: 1, sy: 1, visible: true, clip: null
       });
       const rows = this.rows;
+      if (quiet) return rows;
       console.table(rows);
       console.log(`총 ${found.size}개 URL (페이지 좌표 순서, 위치 미확인 주소는 뒤쪽)\n${rows.map(r => r.url).join("\n")}`);
       console.log(`표시 요소의 선택 주소 ${this.visibleUrls.length}개: copy(mediaGrab.visibleUrls.join('\\n'))`);
@@ -535,8 +723,10 @@
       console.log("설치 없이 브라우저에서 ZIP 다운로드: await mediaGrab.download()");
       if (excluded.size) console.log(`미디어에서 제외한 통계·이벤트 주소 ${excluded.size}개: mediaGrab.excludedRows`);
       if (blockedFrames.size) console.log("접근할 수 없는 iframe:", this.blockedFrames);
+      console.log(`외부 영상 ${this.embeds.length}개 / 원본 영상·재생목록 ${this.videos.length - this.embeds.length}개 / 미확인 리뷰 영상 ${this.pendingVideos.length}개`);
+      if (this.pendingVideos.length) console.log("미확인 리뷰 영상: mediaGrab.pendingVideos. 감시 중에 각 영상을 재생한 뒤 mediaGrab.export() 하세요.");
       return rows;
     }
   };
-  window.mediaGrab.scan();
+  window.mediaGrab.watch({ quiet: false });
 })();

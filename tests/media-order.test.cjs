@@ -85,6 +85,130 @@ function fixture({ scrollX = 0, scrollY = 0, resources = [], documentURL = base,
 const urls = grab => Array.from(grab.urls);
 const visible = grab => Array.from(grab.visibleUrls);
 
+function watchFixture() {
+  const f = fixture(), mutations = [], resources = [], listeners = new Map(), intervals = new Map();
+  const win = f.doc.defaultView;
+  f.doc.addEventListener = (name, listener) => listeners.set(name, listener);
+  f.doc.removeEventListener = (name, listener) => { if (listeners.get(name) === listener) listeners.delete(name); };
+  win.MutationObserver = class {
+    constructor(callback) { this.callback = callback; this.disconnected = false; mutations.push(this); }
+    observe(root, options) { this.root = root; this.options = options; }
+    disconnect() { this.disconnected = true; }
+  };
+  win.PerformanceObserver = class {
+    constructor(callback) { this.callback = callback; this.disconnected = false; resources.push(this); }
+    observe(options) { this.options = options; }
+    disconnect() { this.disconnected = true; }
+  };
+  let next = 0;
+  win.setInterval = callback => { intervals.set(++next, callback); return next; };
+  win.clearInterval = id => intervals.delete(id);
+  return { ...f, mutations, resources, listeners, intervals };
+}
+
+test('YouTube iframe is collected with a video ID even when its document is cross-origin', () => {
+  const f = fixture();
+  const embed = 'https://www.youtube.com/embed/M7lc1UVf-VE?rel=0&autoplay=0';
+  const frame = f.element('iframe', { attrs: { src: embed }, rect: { top: 350, left: 40 } });
+  Object.defineProperty(frame, 'contentDocument', { get() { throw new Error('cross origin'); } });
+  f.doc.body.append(frame);
+  const grab = f.run(), row = grab.embeds[0];
+  assert.equal(grab.embeds.length, 1);
+  assert.deepEqual([row.type, row.provider, row.videoId, row.url, row.embedUrl, row.top, row.visible],
+    ['EMBED', 'youtube', 'M7lc1UVf-VE', 'https://www.youtube.com/watch?v=M7lc1UVf-VE', embed, 350, true]);
+  assert.deepEqual(Array.from(grab.blockedFrames), [embed]);
+});
+
+test('YouTube lazy and no-cookie embeds deduplicate by video ID and reject lookalike hosts', () => {
+  const f = fixture();
+  f.doc.body.append(
+    f.element('iframe', { attrs: { 'data-src': 'https://www.youtube-nocookie.com/embed/M7lc1UVf-VE' }, rect: { top: 200 } }),
+    f.element('iframe', { attrs: { src: 'https://www.youtube.com/embed/M7lc1UVf-VE?start=5' }, rect: { top: 100 } }),
+    f.element('iframe', { attrs: { src: 'https://youtube.com.evil.example/embed/M7lc1UVf-VE' } }),
+    f.element('iframe', { attrs: { src: 'https://www.youtube.com/embed/videoseries?list=anything' } }));
+  const grab = f.run();
+  assert.equal(grab.embeds.length, 1);
+  assert.equal(grab.embeds[0].top, 100);
+  assert.equal(grab.embeds[0].visible, true);
+});
+
+test('review thumbnails remain JPEGs and unresolved videos are reported without guessed URLs', () => {
+  const f = fixture();
+  const key = 'https://video.coupangcdn.com/cloud/PRODUCTREVIEW/202607/29/review-id/video-id/';
+  const thumbnail = key + 'transcode/origin_thumbnail.0000002.jpg';
+  f.doc.body.append(f.img(thumbnail, 900));
+  const grab = f.run();
+  assert.equal(grab.rows[0].type, 'IMAGE');
+  assert.equal(grab.videos.length, 0);
+  assert.equal(grab.pendingVideos.length, 1);
+  assert.equal(grab.getManifest().pendingVideos[0].thumbnailUrl, thumbnail);
+  f.doc.body.append(f.element('video', { attrs: { src: key + 'transcode/actual-720.mp4?signature=full' } }));
+  grab.scan();
+  assert.equal(grab.pendingVideos.length, 0);
+  assert.equal(grab.videos.length, 1);
+  assert.ok(grab.rows.some(row => row.url === thumbnail && row.type === 'IMAGE'));
+});
+
+test('automatic media event watcher retains the source after a review popup is removed', () => {
+  const f = watchFixture(), native = f.element('video', { currentSrc: 'blob:https://shop.example/review' });
+  const wrapper = f.element('video-js');
+  let source = null;
+  wrapper.player = { currentSource: () => source };
+  wrapper.append(native); f.doc.body.append(wrapper);
+  const grab = f.run();
+  assert.equal(grab.watching, true);
+  source = { src: '/late-review.m3u8?signature=complete&expires=999', type: 'application/vnd.apple.mpegurl' };
+  f.listeners.get('loadedmetadata')({ target: wrapper });
+  f.doc.body.children = [];
+  grab.scan({ quiet: true });
+  const row = grab.videos.find(row => row.url.includes('late-review.m3u8'));
+  assert.equal(row.type, 'STREAM');
+  assert.equal(row.url, url(source.src));
+  assert.equal(row.visible, false);
+});
+
+test('MutationObserver captures a video in removedNodes before a later scan loses the popup', () => {
+  const f = watchFixture(), grab = f.run();
+  const video = f.element('video', { attrs: { src: '/short-lived.mp4?token=full' } });
+  video.isConnected = false;
+  f.mutations[0].callback([{ target: f.doc.body, addedNodes: [], removedNodes: [video] }]);
+  assert.ok(grab.videos.some(row => row.url === url('/short-lived.mp4?token=full')));
+});
+
+test('resource watcher retains a late playlist even when resource timing no longer has it', () => {
+  const f = watchFixture(), grab = f.run();
+  f.resources[0].callback({ getEntries: () => [
+    { name: url('/review.m3u8?token=whole'), initiatorType: 'fetch' },
+    { name: 'https://mercury.coupang.com/e.gif?t=watch', initiatorType: 'fetch' },
+    { name: 'https://www.youtube.com/embed/M7lc1UVf-VE', initiatorType: 'iframe' }
+  ] });
+  grab.scan({ quiet: true });
+  assert.equal(grab.videos.length, 2);
+  assert.equal(grab.excludedRows.length, 1);
+  assert.equal(grab.embeds.length, 1);
+  assert.equal(f.resources[0].options.buffered, true);
+});
+
+test('polling catches player API changes and rerunning the snippet disconnects previous watchers', () => {
+  const f = watchFixture(), wrapper = f.element('video-js');
+  let source = null;
+  wrapper.player = { currentSource: () => source };
+  f.doc.body.append(wrapper);
+  const first = f.run();
+  source = { src: '/poll-review.mp4', type: 'video/mp4' };
+  f.intervals.values().next().value();
+  assert.equal(first.videos.length, 1);
+  const second = f.run();
+  assert.equal(first.watching, false);
+  assert.equal(second.watching, true);
+  assert.equal(f.intervals.size, 1);
+  assert.equal(f.mutations[0].disconnected, true);
+  assert.equal(f.resources[0].disconnected, true);
+  second.stopWatching();
+  assert.equal(f.intervals.size, 0);
+  assert.equal(f.listeners.size, 0);
+});
+
 test('page top/left overrides both DOM order and network order; unplaced addresses follow', () => {
   const f = fixture({ resources: ['bottom.jpg', 'orphan.webp', 'right.jpg', 'left.jpg']
     .map(name => ({ name: url(name), initiatorType: 'img' })) });
@@ -586,6 +710,17 @@ async function zipFiles(blob) {
   assert.equal(bytes.readUInt16LE(bytes.length - 12), files.size);
   return files;
 }
+
+test('browser ZIP stores YouTube as a link without fetching a watch page or claiming a video', async () => {
+  const f = downloadFixture({});
+  f.doc.body.append(f.element('iframe', { attrs: { src: 'https://www.youtube.com/embed/M7lc1UVf-VE' } }));
+  const report = await f.run().download();
+  assert.equal(f.requests.length, 0);
+  assert.equal(report.results[0].status, 'link');
+  assert.equal(report.results[0].filename, '0001.url');
+  const files = await zipFiles(f.blobs.get(report.archives[0].url));
+  assert.match(files.get('0001.url').toString(), /URL=https:\/\/www.youtube.com\/watch\?v=M7lc1UVf-VE/);
+});
 
 test('browser ZIP preserves page order and GIF bytes and corrects misleading extensions', async () => {
   const f = downloadFixture({ [url('/top.jpg')]: new Response(pngBytes) });

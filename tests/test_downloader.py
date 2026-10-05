@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 spec = importlib.util.spec_from_file_location('media_downloader', Path(__file__).parents[1] / 'download-media.py')
@@ -83,6 +84,15 @@ class DownloadTests(unittest.TestCase):
     def download(self, path, order=1):
         return downloader.download_one({'order': order, 'url': self.base + path, 'type': 'IMAGE'},
                                        self.folder, 4, 'https://shop.example/', 2)
+
+    def test_youtube_link_is_saved_without_requesting_html(self):
+        job = {'order': 128, 'type': 'EMBED', 'url': 'https://www.youtube.com/watch?v=M7lc1UVf-VE'}
+        with mock.patch.object(downloader.urllib.request, 'urlopen', side_effect=AssertionError('must not fetch HTML')):
+            result = downloader.download_one(job, self.folder, 4, '', 2)
+        self.assertEqual(result['status'], 'link')
+        self.assertEqual(result['filename'], '0128.url')
+        self.assertIn(job['url'], (self.folder / '0128.url').read_text())
+        self.assertFalse(list(self.folder.glob('*.mp4')))
 
     def test_bytes_and_actual_extension_preserved(self):
         for i, (path, data, extension) in enumerate([
