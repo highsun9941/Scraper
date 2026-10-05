@@ -49,7 +49,7 @@ function Read-MediaList([string]$Path, [bool]$FailuresOnly) {
         $url = $url.Trim()
         if (-not $url) { throw 'URL이 없는 항목이 있습니다.' }
         if (-not $seen.Add($url)) { continue }
-        $jobs.Add([pscustomobject]@{ order = $nextOrder; source_order = $sourceOrder; url = $url })
+        $jobs.Add([pscustomobject]@{ order = $nextOrder; source_order = $sourceOrder; url = $url; type = [string](Get-Property $item 'type') })
     }
     if ($jobs.Count -eq 0) { throw '다운로드할 주소가 없습니다. -OnlyFailed는 실패 상태가 있는 리포트에 사용하세요.' }
     return @{ jobs = $jobs.ToArray(); pageUrl = $pageUrl }
@@ -166,6 +166,15 @@ function Receive-Media($Job, [string]$Folder, [int]$Width, $Client, [string]$Ref
                 $result.status = 'skipped'; $result.message = '통계·이벤트 요청 주소입니다.'; return $result
             }
             if ($uri.UserInfo) { throw '계정 정보가 포함된 주소는 지원하지 않습니다.' }
+            if ($Job.type -eq 'EMBED' -or $uri.Host -in @('youtube.com','www.youtube.com','m.youtube.com','youtu.be','www.youtube-nocookie.com')) {
+                if ($Job.url.Contains("`r") -or $Job.url.Contains("`n")) { throw '링크 주소에 줄바꿈이 포함되어 있습니다.' }
+                $result.filename = $Job.order.ToString(('D' + $Width)) + '.url'
+                $target = [IO.Path]::Combine($Folder, $result.filename)
+                [IO.File]::WriteAllText($target, "[InternetShortcut]`r`nURL=" + $Job.url + "`r`n", [Text.UTF8Encoding]::new($false))
+                $result.bytes = ([IO.FileInfo]$target).Length
+                $result.status = 'link'; $result.message = '외부 영상 페이지 링크입니다. 영상 파일은 download-videos.py로 다운로드하세요.'
+                return $result
+            }
         }
         $temporary = [IO.Path]::Combine($Folder, '.media-' + [Guid]::NewGuid().ToString('N') + '.part')
         if ($isData) {
@@ -266,8 +275,9 @@ try {
         (ConvertTo-Json -InputObject $report -Depth 8) + "`r`n", [Text.UTF8Encoding]::new($false))
     $saved = @($all | Where-Object { $_.status -eq 'saved' }).Count
     $playlists = @($all | Where-Object { $_.status -eq 'playlist' }).Count
-    $failed = $all.Length - $saved - $playlists
-    Write-Host ('완료: 파일 {0}개 / 재생목록 {1}개 / 실패·건너뜀 {2}개' -f $saved,$playlists,$failed)
+    $links = @($all | Where-Object { $_.status -eq 'link' }).Count
+    $failed = $all.Length - $saved - $playlists - $links
+    Write-Host ('완료: 파일 {0}개 / 재생목록 {1}개 / 외부 영상 링크 {2}개 / 실패·건너뜀 {3}개' -f $saved,$playlists,$links,$failed)
     Write-Host ('실패 기록: ' + [IO.Path]::Combine($folder,'failed.csv'))
     if ($failed) { exit 2 }
     exit 0

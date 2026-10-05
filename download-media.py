@@ -144,6 +144,15 @@ def download_one(job: dict, folder: Path, width: int, referer: str, timeout: flo
             return result
         if parsed.username or parsed.password:
             raise ValueError("계정 정보가 포함된 주소는 지원하지 않습니다.")
+        if job.get("type") == "EMBED" or parsed.hostname in (
+                "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtube-nocookie.com"):
+            if "\n" in job["url"] or "\r" in job["url"]:
+                raise ValueError("링크 주소에 줄바꿈이 포함되어 있습니다.")
+            filename = f"{job['order']:0{width}d}.url"
+            (folder / filename).write_text("[InternetShortcut]\nURL=" + job["url"] + "\n", encoding="utf-8")
+            result.update(status="link", filename=filename, bytes=(folder / filename).stat().st_size,
+                          message="외부 영상 페이지 링크입니다. 영상 파일은 download-videos.py로 다운로드하세요.")
+            return result
         handle = tempfile.NamedTemporaryFile(prefix=".media-", suffix=".part", dir=folder, delete=False)
         temporary = Path(handle.name)
         with handle:
@@ -234,8 +243,9 @@ def main(argv: list[str] | None = None) -> int:
     write_reports(folder, results)
     saved = sum(row["status"] == "saved" for row in results)
     playlists = sum(row["status"] == "playlist" for row in results)
-    unsuccessful = len(results) - saved - playlists
-    print(f"완료: 파일 {saved}개 / 재생목록 {playlists}개 / 실패·건너뜀 {unsuccessful}개")
+    links = sum(row["status"] == "link" for row in results)
+    unsuccessful = len(results) - saved - playlists - links
+    print(f"완료: 파일 {saved}개 / 재생목록 {playlists}개 / 외부 영상 링크 {links}개 / 실패·건너뜀 {unsuccessful}개")
     print(f"실패 기록: {folder / 'failed.csv'}")
     return 2 if unsuccessful else 0
 
