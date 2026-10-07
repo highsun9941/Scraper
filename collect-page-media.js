@@ -120,10 +120,11 @@
     if (info) add(info.url, "EMBED", base, source, position, visible, element,
       { provider: info.provider, videoId: info.videoId, embedUrl: info.embedUrl });
   };
-  const addResource = (r, base) => {
+  const addResource = (r, base, doc = null) => {
     const kind = r.initiatorType === "img" ? "IMAGE" : r.initiatorType === "video" ? "VIDEO" : "";
     add(r.name, kind, base, "network");
     if (r.initiatorType === "iframe") addEmbed(r.name, base, "network.iframe");
+    if (doc) rememberReviewRequest(r.name, doc);
   };
   const reviewKey = (raw, base) => {
     try {
@@ -136,6 +137,281 @@
   const rememberPreview = (raw, base) => {
     const key = reviewKey(raw, base), href = absolute(raw, base);
     if (key && href && !reviewPreviews.has(key)) reviewPreviews.set(key, href);
+  };
+  // 리뷰 데이터에 실제로 들어 있는 URL만 읽습니다. 썸네일에서 MP4 경로를 만들지 않습니다.
+  const reviewLimit = 2 * 1024 ** 2, reviewTasks = new Set(), reviewRequests = new Map(), reviewFetchers = new Map();
+  const reviewErrors = new Map(), reviewLimits = new Set(), scriptTexts = new WeakMap();
+  let reviewPropsVisited = new WeakSet(), reviewFibersVisited = new WeakSet();
+  let reviewRun = null, reviewReady = Promise.resolve(), watchEpoch = 0;
+  const ownValue = (object, key) => {
+    try { return Object.getOwnPropertyDescriptor(object, key)?.value; } catch { return undefined; }
+  };
+  const reviewSource = (raw, base, source, hint = "") => {
+    if (typeof raw !== "string" || raw.includes("\\")) return false;
+    const href = absolute(raw, base);
+    if (!href) return;
+    try {
+      const u = new URL(href), type = guess(href);
+      if (!/^https?:$/.test(u.protocol) || u.hostname !== "video.coupangcdn.com" ||
+          !/^\/cloud\/PRODUCTREVIEW\//i.test(u.pathname) ||
+          /(?:thumbnail|poster)/i.test(u.pathname) || ["IMAGE", "GIF"].includes(type)) return;
+      if (["VIDEO", "STREAM"].includes(type) || hint) { add(href, type || hint, base, source); return true; }
+    } catch {}
+  };
+  const reviewText = (text, base, source) => {
+    if (typeof text !== "string") return;
+    if (text.length > reviewLimit) { reviewLimits.add(source); return; }
+    // JSON/HTML에 보관된 슬래시·앰퍼샌드 표기만 해제하며 스크립트를 실행하지 않습니다.
+    const decoded = text.replace(/\\u([\da-f]{4})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+      .replace(/\\(?:x2f|\/)/gi, "/").replace(/\\x26/gi, "&")
+      .replace(/&amp;|&#0*38;|&#x0*26;/gi, "&").replace(/&quot;|&#0*34;|&#x0*22;/gi, '"')
+      .replace(/&apos;|&#0*39;|&#x0*27;/gi, "'");
+    for (const m of decoded.matchAll(/(?:https?:)?\/\/video\.coupangcdn\.com\/cloud\/PRODUCTREVIEW\/[^\s"'<>\\)]+/gi)) {
+      if (decoded[m.index + m[0].length] !== "\\") reviewSource(m[0], base, source);
+    }
+  };
+  const reviewData = (data, base, source, win) => {
+    const seen = new WeakSet(), stack = [{ value: data, depth: 0, hint: "" }];
+    let count = 0;
+    while (stack.length && count++ < 20000) {
+      const { value, depth, hint } = stack.pop();
+      if (typeof value === "string") {
+        if (value.length <= 32768) {
+          // JSON의 실제 URL 문자열에는 HTML 엔티티 변환을 적용하지 않습니다(서명 보존).
+          if (!reviewSource(value, base, source, hint)) reviewText(value, base, source);
+        }
+        else reviewLimits.add(source);
+        continue;
+      }
+      if (!value || typeof value !== "object" || seen.has(value)) continue;
+      seen.add(value);
+      // DOM·React의 소유자 링크는 건너뛰며 getter와 함수는 실행하지 않습니다.
+      if (value === win || value === win?.document || ownValue(value, "ownerDocument") ||
+          typeof win?.Node === "function" && value instanceof win.Node) continue;
+      if (depth >= 20) { reviewLimits.add(source); continue; }
+      let keys;
+      try { keys = Object.getOwnPropertyNames(value); } catch { continue; }
+      const mime = ownValue(value, "mimeType") || ownValue(value, "contentType") || ownValue(value, "type");
+      const mediaHint = typeof mime === "string" && /^(?:video\/|application\/(?:vnd\.apple\.mpegurl|x-mpegurl|dash\+xml))/i.test(mime) ?
+        (/mpegurl|dash\+xml/i.test(mime) ? "STREAM" : "VIDEO") : hint;
+      const remaining = Math.max(0, 20000 - count - stack.length);
+      if (keys.length > remaining) reviewLimits.add(source);
+      for (const key of keys.slice(0, remaining).reverse()) {
+        if (["__proto__", "constructor", "prototype", "_owner", "stateNode", "return", "sibling", "child", "alternate", "ref"].includes(key)) continue;
+        const child = ownValue(value, key);
+        if (child === undefined || typeof child === "function") continue;
+        stack.push({ value: child, depth: depth + 1,
+          hint: /^(?:videos?|video(?:url|src|source|sources|files?)|play(?:url|src)|stream(?:url|src))$/i.test(key.replace(/[_-]/g, "")) ? "VIDEO" : mediaHint });
+      }
+    }
+    if (stack.length) reviewLimits.add(source);
+  };
+  const reviewPayload = (text, base, source, win) => {
+    if (typeof text !== "string") return;
+    if (text.length > reviewLimit) { reviewLimits.add(source); return; }
+    try { reviewData(JSON.parse(text), base, source, win); }
+    catch { reviewText(text, base, source); }
+  };
+  const captureReviewScript = (el, base, win) => {
+    if (el?.localName !== "script") return;
+    const text = el.textContent || "";
+    if (!text || scriptTexts.get(el) === text) return;
+    if (text.length > reviewLimit) { reviewLimits.add("review.script"); return; }
+    scriptTexts.set(el, text);
+    if (/^application\/(?:ld\+)?json$/i.test(el.getAttribute("type") || "") || el.getAttribute("id") === "__NEXT_DATA__") {
+      reviewPayload(text, base, "review.script.json", win);
+    } else reviewText(text, base, "review.script.url");
+  };
+  const captureReviewProps = (el, base, win) => {
+    // 썸네일 주변의 데이터만 검사합니다. React 내부 필드가 없거나 바뀌면 건너뜁니다.
+    for (let parent = el, level = 0; parent && level < 8; parent = parentOf(parent), level++) {
+      if (reviewPropsVisited.has(parent)) continue;
+      reviewPropsVisited.add(parent);
+      for (const attr of ["data-review-media-original-src", "data-review-media-url", "data-video-src", "data-video-url", "data-review", "data-media", "data-props", "data-urls"]) {
+        const value = parent.getAttribute?.(attr);
+        if (value) {
+          if (/video|media-original-src|media-url/.test(attr)) reviewSource(value, base, `review.${attr}`, "VIDEO");
+          reviewPayload(value, base, `review.${attr}`, win);
+        }
+      }
+      let keys;
+      try { keys = Object.getOwnPropertyNames(parent); } catch { continue; }
+      for (const key of keys) {
+        if (key.startsWith("__reactProps$")) reviewData(ownValue(parent, key), base, "review.react.props", win);
+        if (!/^(?:__reactFiber\$|__reactInternalInstance\$)/.test(key)) continue;
+        for (let fiber = ownValue(parent, key), depth = 0; fiber && typeof fiber === "object" && depth < 12 && !reviewFibersVisited.has(fiber); depth++) {
+          reviewFibersVisited.add(fiber);
+          for (const field of ["memoizedProps", "pendingProps", "memoizedState"]) reviewData(ownValue(fiber, field), base, `review.react.${field}`, win);
+          fiber = ownValue(fiber, "return");
+        }
+      }
+    }
+  };
+  const linkReviewPositions = () => {
+    for (const [key, thumbnail] of reviewPreviews) {
+      const preview = found.get(thumbnail);
+      if (!preview?.position) continue;
+      for (const row of found.values()) {
+        if (["VIDEO", "STREAM"].includes(row.type) && row.url.startsWith(key) && !row.position) {
+          // 썸네일 옆에 정렬하지만, 영상이 표시됐다고 표기하지는 않습니다.
+          row.position = { ...preview.position }; row.element = preview.element;
+        }
+      }
+    }
+  };
+  const reviewEndpoint = (raw, doc) => {
+    try {
+      const u = new URL(raw, doc.baseURI), page = new URL(doc.URL || doc.baseURI);
+      if (!/^https?:$/.test(u.protocol) || u.origin !== page.origin ||
+          !/(?:^|\/)reviews?(?:\/|$)/i.test(u.pathname) ||
+          /(?:^|\/)(?:create|write|save|delete|remove|report|vote|helpful|upload)(?:\/|$)/i.test(u.pathname)) return null;
+      u.hash = "";
+      return u;
+    } catch { return null; }
+  };
+  const rememberReviewRequest = (raw, doc, method = null) => {
+    const u = reviewEndpoint(raw, doc);
+    if (!u) return;
+    const old = reviewRequests.get(u.href);
+    // 과거 Resource Timing에는 메서드가 없습니다. 쿠팡의 관찰된 리뷰 목록 경로만 GET 재조회 후보로 둡니다.
+    const legacyList = /^(?:www\.)?coupang\.com$/i.test(u.hostname) && u.pathname === "/vp/product/reviews";
+    reviewRequests.set(u.href, { url: u.href, doc, method: method ?? old?.method ?? (legacyList ? "GET" : ""),
+      list: /\/(?:reviews?|reviews?\/(?:list|search))\/?$/i.test(u.pathname) });
+  };
+  const trackReviewTask = task => {
+    reviewTasks.add(task);
+    task.then(() => reviewTasks.delete(task), () => reviewTasks.delete(task));
+    return task;
+  };
+  const waitReviewTasks = async () => {
+    if (!reviewTasks.size) return;
+    const completed = Promise.allSettled([...reviewTasks]);
+    if (typeof window.setTimeout !== "function") { await completed; return; }
+    let timer;
+    try {
+      // 페이지가 리뷰 요청을 끝내지 않아도 콘솔 명령이 무한정 대기하지 않게 합니다.
+      await Promise.race([completed, new Promise(resolve => { timer = window.setTimeout(resolve, 8000); })]);
+    } finally { window.clearTimeout?.(timer); }
+  };
+  const readReviewResponse = async (response, doc, source, epoch) => {
+    if (!watching || epoch !== watchEpoch || !response?.ok) return;
+    if (response.url && !reviewEndpoint(response.url, doc)) return;
+    const mime = response.headers?.get("Content-Type") || "";
+    if (!/(?:json|text\/(?:plain|html))/i.test(mime)) return;
+    if (Number(response.headers?.get("Content-Length")) > reviewLimit) { reviewLimits.add(source); return; }
+    const clone = response.clone();
+    let text = "";
+    if (clone.body?.getReader && typeof TextDecoder === "function") {
+      const reader = clone.body.getReader(), decoder = new TextDecoder();
+      const cancel = () => { reader.cancel().catch(() => {}); };
+      cleanups.add(cancel);
+      let bytes = 0;
+      try {
+        for (;;) {
+          const part = await reader.read();
+          if (part.done) break;
+          bytes += part.value.byteLength;
+          if (bytes > reviewLimit) { reviewLimits.add(source); reader.cancel().catch(() => {}); return; }
+          text += decoder.decode(part.value, { stream: true });
+        }
+        text += decoder.decode();
+      } finally { cleanups.delete(cancel); reader.releaseLock(); }
+    } else {
+      // 스트림 API가 없는 환경에서 크기 미상의 본문을 무제한 복제하지 않습니다.
+      if (clone.body && !response.headers?.get("Content-Length")) { reviewLimits.add(source); return; }
+      text = await clone.text();
+    }
+    if (watching && epoch === watchEpoch) {
+      reviewPayload(text, doc.baseURI, source, doc.defaultView); linkReviewPositions();
+    }
+  };
+  const observeReviewResponses = (win, doc) => {
+    const epoch = watchEpoch;
+    if (typeof win.fetch === "function") {
+      const original = win.fetch;
+      reviewFetchers.set(win, original);
+      const wrapped = function (...args) {
+        const promise = Reflect.apply(original, this, args);
+        try {
+          const input = args[0], request = typeof win.Request === "function" && input instanceof win.Request;
+          const href = typeof input === "string" ? input : input instanceof URL ? input.href : request ? input.url : "";
+          const fallback = request ? input.method : "GET";
+          const descriptor = Object.getOwnPropertyDescriptor(Object(args[1]), "method");
+          // accessor·상속된 method는 읽지 않고 미확인으로 둡니다. POST를 GET으로 추정하지 않습니다.
+          const method = descriptor ? ("value" in descriptor ? String(descriptor.value === undefined ? fallback : descriptor.value).toUpperCase() : "") :
+            args[1] && "method" in Object(args[1]) ? "" : fallback;
+          if (watching && epoch === watchEpoch && reviewEndpoint(href, doc)) {
+            rememberReviewRequest(href, doc, method);
+            // 원래 Promise에 바로 연결해야 iframe 등 다른 realm에서도 페이지보다 먼저 clone할 수 있습니다.
+            trackReviewTask(promise.then(response => readReviewResponse(response, doc, "review.fetch", epoch))
+              .catch(error => reviewErrors.set(href, error.message)));
+          }
+        } catch {}
+        return promise; // 페이지에는 원래 Promise·Response를 돌려주고 복제한 본문만 읽습니다.
+      };
+      try {
+        win.fetch = wrapped;
+        cleanups.add(() => { if (win.fetch === wrapped) win.fetch = original; reviewFetchers.delete(win); });
+      } catch {}
+    }
+    const proto = win.XMLHttpRequest?.prototype;
+    if (!proto?.open || !proto?.send) return;
+    const originalOpen = proto.open, originalSend = proto.send, requests = new WeakMap();
+    const open = function (...args) {
+      const result = Reflect.apply(originalOpen, this, args);
+      const href = absolute(typeof args[1] === "string" ? args[1] : args[1] instanceof URL ? args[1].href : "", doc.baseURI);
+      requests.set(this, { href, method: typeof args[0] === "string" ? args[0].toUpperCase() : "" });
+      return result;
+    };
+    const send = function (...args) {
+      const request = requests.get(this);
+      if (!watching || epoch !== watchEpoch || !request || !reviewEndpoint(request.href, doc)) return Reflect.apply(originalSend, this, args);
+      rememberReviewRequest(request.href, doc, request.method);
+      const xhr = this;
+      const remove = () => { xhr.removeEventListener("loadend", loaded); cleanups.delete(remove); };
+      const loaded = () => {
+        remove();
+        if (!watching || epoch !== watchEpoch || xhr.status < 200 || xhr.status >= 300 ||
+            xhr.responseURL && !reviewEndpoint(xhr.responseURL, doc)) return;
+        try {
+          if (xhr.responseType === "json") reviewData(xhr.response, doc.baseURI, "review.xhr.json", win);
+          else if (["", "text"].includes(xhr.responseType || "")) reviewPayload(xhr.responseText, doc.baseURI, "review.xhr", win);
+          linkReviewPositions();
+        } catch (error) { reviewErrors.set(request.href, error.message); }
+      };
+      xhr.addEventListener("loadend", loaded, { once: true }); cleanups.add(remove);
+      try { return Reflect.apply(originalSend, this, args); } catch (error) { remove(); throw error; }
+    };
+    try {
+      proto.open = open; proto.send = send;
+      cleanups.add(() => { if (proto.open === open) proto.open = originalOpen; if (proto.send === send) proto.send = originalSend; });
+    } catch {}
+  };
+  const refreshReviewResponses = () => {
+    if (reviewRun) return reviewRun;
+    const epoch = watchEpoch;
+    const run = (async () => {
+      const candidates = [...reviewRequests.values()].filter(r => r.list && r.method === "GET");
+      if (candidates.length > 8) reviewLimits.add("review.requests");
+      for (const r of candidates.slice(0, 8)) {
+        const win = r.doc.defaultView;
+        if (!watching || epoch !== watchEpoch) break;
+        if (typeof win?.fetch !== "function" || typeof win.AbortController !== "function") continue;
+        const controller = new win.AbortController(), abort = () => controller.abort();
+        cleanups.add(abort);
+        const timer = win.setTimeout?.(abort, 8000);
+        try {
+          const response = await Reflect.apply(reviewFetchers.get(win) || win.fetch, win,
+            [r.url, { method: "GET", credentials: "same-origin", signal: controller.signal }]);
+          if (!response.ok) throw new Error(`리뷰 목록 응답 HTTP ${response.status}`);
+          await readReviewResponse(response, r.doc, "review.refresh", epoch);
+          reviewErrors.delete(r.url);
+        } catch (error) { reviewErrors.set(r.url, error.message); }
+        finally { win.clearTimeout?.(timer); cleanups.delete(abort); }
+      }
+    })().finally(() => { if (reviewRun === run) reviewRun = null; });
+    reviewRun = run;
+    return run;
   };
   const srcset = (text, kind, base, source, position, primary, element) => {
     let i = 0;
@@ -237,13 +513,16 @@
       }
     }
     if (tag === "img") {
+      let review = false;
       for (const raw of previewSources) {
         if (reviewKey(raw, base)) {
+          review = true;
           rememberPreview(raw, base);
           add(raw, "IMAGE", base, "review.thumbnail", position,
             absolute(raw, base) === absolute(el.currentSrc || el.getAttribute("src"), base), element);
         }
       }
+      if (review) captureReviewProps(el, base, win);
     }
     if (tag === "video") {
       const primary = absolute(el.currentSrc || el.getAttribute("src"), base);
@@ -263,16 +542,21 @@
   let watching = false, pollTimer = null;
   let watchedRoots = new Map(), watchedWindows = new Map();
   const cleanups = new Set();
-  const captureTree = (root, ctx) => {
+  const captureTree = (root, ctx, nested = false) => {
     styles = new WeakMap(); layouts = new WeakMap();
+    if (!nested) { reviewPropsVisited = new WeakSet(); reviewFibersVisited = new WeakSet(); }
     if ((root?.ownerDocument || root) === document) {
       ctx = { ...ctx, x: Number(window.scrollX) || 0, y: Number(window.scrollY) || 0 };
     }
     captureMedia(root, ctx);
-    for (const el of root?.querySelectorAll?.("video, video-js, .video-js, iframe, object, embed, img") || []) {
+    const doc = root?.ownerDocument || root;
+    captureReviewScript(root, doc?.baseURI, doc?.defaultView);
+    for (const el of root?.querySelectorAll?.("video, video-js, .video-js, iframe, object, embed, img, script") || []) {
       captureMedia(el, ctx);
-      if (el.shadowRoot) captureTree(el.shadowRoot, ctx);
+      captureReviewScript(el, el.baseURI || doc?.baseURI, doc?.defaultView);
+      if (el.shadowRoot) captureTree(el.shadowRoot, ctx, true);
     }
+    linkReviewPositions();
   };
   const observeRoot = (root, ctx) => {
     if (!watching) return;
@@ -309,10 +593,12 @@
     } catch {}
     if (watchedWindows.has(win)) return;
     watchedWindows.set(win, true);
+    observeReviewResponses(win, root.ownerDocument || root);
     try {
       if (typeof win.PerformanceObserver === "function") {
         const observer = new win.PerformanceObserver(list => {
-          if (watching) for (const resource of list.getEntries()) addResource(resource, (root.ownerDocument || root).baseURI);
+          const doc = root.ownerDocument || root;
+          if (watching) for (const resource of list.getEntries()) addResource(resource, doc.baseURI, doc);
         });
         observer.observe({ type: "resource", buffered: true });
         cleanups.add(() => observer.disconnect());
@@ -330,7 +616,10 @@
       seen.add(win);
       let resources = [];
       try { resources = win.performance?.getEntriesByType?.("resource") || []; } catch {}
-      for (const r of resources) addResource(r, doc.baseURI);
+      for (const r of resources) addResource(r, doc.baseURI, doc);
+      for (const key of ["__NEXT_DATA__", "__INITIAL_STATE__", "__PRELOADED_STATE__", "__NUXT__"]) {
+        reviewData(ownValue(win, key), doc.baseURI, `review.page.${key}`, win);
+      }
     }
     for (const el of root.querySelectorAll("*")) {
       const element = elementOrder++, tag = el.localName, parent = el.parentElement?.localName;
@@ -364,6 +653,7 @@
       if (tag === "image") emit(el.getAttribute("href") || el.getAttribute("xlink:href"), "IMAGE", "svg.image");
       if (tag === "video") emit(el.getAttribute("poster"), "IMAGE", "video.poster", true);
       captureMedia(el, ctx, element);
+      captureReviewScript(el, base, win);
       if (["a", "link"].includes(tag)) add(el.getAttribute("href"), "", base, `${tag}.href`);
       for (const a of ["data-bg", "data-background", "data-background-image", "data-image", "data-image-src", "data-video-src", "data-video-url", "data-poster"]) {
         const value = el.getAttribute(a);
@@ -564,8 +854,23 @@
         .map(([, thumbnailUrl]) => {
           const row = found.get(thumbnailUrl);
           return { thumbnailUrl, top: row?.position?.top ?? null, left: row?.position?.left ?? null,
-            visible: row?.visible || false, message: "썸네일만 확인됨. 리뷰 영상을 재생해 원본 주소를 수집하세요." };
+            visible: row?.visible || false, message: "원본 영상 주소 미확인. 페이지·리뷰 응답이 썸네일만 제공하면 재생 없이 추출할 수 없습니다." };
         });
+    },
+    get ready() { return reviewReady; },
+    get reviewCollection() {
+      return { pendingResponses: reviewTasks.size, refreshing: Boolean(reviewRun),
+        observedLists: [...reviewRequests.values()].filter(r => r.list && r.method === "GET").length,
+        limitsReached: [...reviewLimits], errors: [...reviewErrors].map(([url, message]) => ({ url, message })) };
+    },
+    async collectReviewVideos({ refresh = true } = {}) {
+      this.scan({ quiet: true });
+      if (refresh && this.pendingVideos.length) await refreshReviewResponses();
+      await waitReviewTasks();
+      linkReviewPositions();
+      const result = { videos: this.videos, pendingVideos: this.pendingVideos, ...this.reviewCollection };
+      console.log(`재생 없이 리뷰 데이터 확인: 영상·임베드 ${result.videos.length}개 / 원본 미확인 리뷰 ${result.pendingVideos.length}개 / 응답 대기 ${result.pendingResponses}개`);
+      return result;
     },
     get watching() { return watching; },
     watch({ intervalMs = 1000, quiet = true } = {}) {
@@ -578,15 +883,23 @@
           try { captureTree(root, ctx); } catch {}
         }
       }, intervalMs);
-      console.log("영상 감시 시작: 리뷰 영상을 하나씩 재생하세요. 종료: mediaGrab.stopWatching()");
+      // 초기 DOM 스캔 결과에 원본이 없는 경우에만 관찰된 리뷰 목록을 재조회합니다.
+      reviewReady = (async () => {
+        if (this.pendingVideos.length) await refreshReviewResponses();
+        await waitReviewTasks();
+        linkReviewPositions();
+        return { videos: this.videos, pendingVideos: this.pendingVideos, ...this.reviewCollection };
+      })();
+      console.log("리뷰 데이터·영상 감시 시작. 자동 수집 완료 대기: await mediaGrab.ready. 종료: mediaGrab.stopWatching()");
       return { watching, intervalMs };
     },
     stopWatching() {
-      watching = false;
+      watching = false; watchEpoch++;
       if (pollTimer !== null) window.clearInterval?.(pollTimer);
       pollTimer = null;
       for (const cleanup of cleanups) { try { cleanup(); } catch {} }
       cleanups.clear(); watchedRoots = new Map(); watchedWindows = new Map();
+      reviewRequests.clear(); reviewFetchers.clear(); reviewRun = null;
       return { watching: false };
     },
     get lastDownload() { return downloadReport; },
@@ -685,11 +998,13 @@
         visibleOnly: Boolean(visibleOnly),
         items: visibleOnly ? this.visibleRows : this.rows,
         blockedFrames: this.blockedFrames,
-        pendingVideos: this.pendingVideos
+        pendingVideos: this.pendingVideos,
+        reviewCollection: this.reviewCollection
       };
     },
     export(options = {}) {
       const manifest = this.getManifest(options);
+      if (manifest.reviewCollection.refreshing || manifest.reviewCollection.pendingResponses) console.log("리뷰 응답 수집 중입니다. await mediaGrab.collectReviewVideos() 후 다시 내보내면 최신 결과를 포함합니다.");
       const blob = new Blob([JSON.stringify(manifest, null, 2)], { type: "application/json;charset=utf-8" });
       const href = URL.createObjectURL(blob), link = document.createElement("a");
       link.href = href;
@@ -706,6 +1021,7 @@
     },
     scan({ quiet = false } = {}) {
       styles = new WeakMap(); layouts = new WeakMap(); elementOrder = 0;
+      reviewPropsVisited = new WeakSet(); reviewFibersVisited = new WeakSet();
       blockedFrames.clear();
       for (const row of found.values()) Object.assign(row, { position: null, visible: false, element: Infinity });
       const win = document.defaultView || window;
@@ -714,6 +1030,7 @@
         y: Number(win.scrollY) || Number(document.documentElement?.scrollTop) || 0,
         sx: 1, sy: 1, visible: true, clip: null
       });
+      linkReviewPositions();
       const rows = this.rows;
       if (quiet) return rows;
       console.table(rows);
@@ -724,7 +1041,7 @@
       if (excluded.size) console.log(`미디어에서 제외한 통계·이벤트 주소 ${excluded.size}개: mediaGrab.excludedRows`);
       if (blockedFrames.size) console.log("접근할 수 없는 iframe:", this.blockedFrames);
       console.log(`외부 영상 ${this.embeds.length}개 / 원본 영상·재생목록 ${this.videos.length - this.embeds.length}개 / 미확인 리뷰 영상 ${this.pendingVideos.length}개`);
-      if (this.pendingVideos.length) console.log("미확인 리뷰 영상: mediaGrab.pendingVideos. 감시 중에 각 영상을 재생한 뒤 mediaGrab.export() 하세요.");
+      if (this.pendingVideos.length) console.log("미확인 리뷰 영상: mediaGrab.pendingVideos. await mediaGrab.collectReviewVideos()로 리뷰 데이터를 확인하세요.");
       return rows;
     }
   };

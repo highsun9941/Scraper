@@ -85,8 +85,8 @@ function fixture({ scrollX = 0, scrollY = 0, resources = [], documentURL = base,
 const urls = grab => Array.from(grab.urls);
 const visible = grab => Array.from(grab.visibleUrls);
 
-function watchFixture() {
-  const f = fixture(), mutations = [], resources = [], listeners = new Map(), intervals = new Map();
+function watchFixture(options = {}) {
+  const f = fixture(options), mutations = [], resources = [], listeners = new Map(), intervals = new Map();
   const win = f.doc.defaultView;
   f.doc.addEventListener = (name, listener) => listeners.set(name, listener);
   f.doc.removeEventListener = (name, listener) => { if (listeners.get(name) === listener) listeners.delete(name); };
@@ -105,6 +105,316 @@ function watchFixture() {
   win.clearInterval = id => intervals.delete(id);
   return { ...f, mutations, resources, listeners, intervals };
 }
+
+const reviewRoot = 'https://video.coupangcdn.com/cloud/PRODUCTREVIEW/202610/07/review-id/video-id/';
+const reviewThumb = reviewRoot + 'transcode/origin_thumbnail.0000002.jpg';
+const reviewVideo = reviewRoot + 'transcode/actual-720.mp4?signature=a%2Bb&expires=999';
+function reviewFixture(options = {}) {
+  const f = watchFixture(options), win = f.doc.defaultView;
+  Object.assign(win, { AbortController, Request, setTimeout, clearTimeout });
+  f.context.TextDecoder = TextDecoder;
+  f.doc.body.append(f.img(reviewThumb, 900, 20));
+  return f;
+}
+
+test('review hydration JSON collects signed originals without playback, clicking or network requests', async () => {
+  const f = reviewFixture(), win = f.doc.defaultView;
+  win.fetch = () => assert.fail('metadata must not request a video or review response');
+  win.__NEXT_DATA__ = { props: { pageProps: { reviews: [{ media: { videoUrl: reviewVideo } }] } } };
+  const script = f.element('script', { attrs: { type: 'application/json' } });
+  script.textContent = JSON.stringify({ reviews: [{ src: reviewRoot + 'transcode/actual.m3u8?token=whole' }] }).replaceAll('/', '\\/');
+  const button = f.element('button'); button.click = () => assert.fail('no review click');
+  const video = f.element('video'); video.play = () => assert.fail('no playback');
+  f.doc.body.append(script, button, video);
+  const grab = f.run(); await grab.ready;
+  assert.deepEqual(Array.from(grab.videos, row => [row.type, row.url, row.top, row.visible]), [
+    ['VIDEO', reviewVideo, 900, false], ['STREAM', reviewRoot + 'transcode/actual.m3u8?token=whole', 900, false]
+  ]);
+  assert.equal(grab.pendingVideos.length, 0);
+  assert.ok(grab.rows.some(row => row.url === reviewThumb && row.type === 'IMAGE'));
+  grab.scan({ quiet: true });
+  assert.equal(grab.videos[0].top, 900);
+  grab.stopWatching();
+});
+
+test('review props and fiber state are read near a thumbnail while cycles, DOM and getters are ignored', () => {
+  const f = reviewFixture(), thumbnail = f.doc.body.children[0];
+  const state = { next: null, attachments: [{ video_url: reviewVideo }], dom: thumbnail };
+  state.next = state;
+  Object.defineProperty(state, 'dangerous', { get() { assert.fail('must not execute a page getter'); } });
+  const fiber = { memoizedState: state }; fiber.return = fiber;
+  Object.defineProperty(thumbnail, '__reactFiber$fixture', { value: fiber });
+  Object.defineProperty(thumbnail, '__reactProps$fixture', { get() { assert.fail('must not read an accessor prop'); } });
+  const grab = f.run();
+  assert.deepEqual(Array.from(grab.videos, row => row.url), [reviewVideo]);
+  assert.equal(grab.pendingVideos.length, 0);
+  grab.stopWatching();
+});
+
+test('review text handles escaped JSON and HTML URLs and does not turn images into video', () => {
+  const f = reviewFixture(), script = f.element('script');
+  const encoded = reviewVideo.replaceAll('/', '\\u002f').replaceAll('&', '\\u0026').replaceAll('=', '\\u003d');
+  script.textContent = `window.loadedReview = {url: "${encoded}"};`;
+  f.doc.body.append(script);
+  const grab = f.run();
+  assert.deepEqual(Array.from(grab.videos, row => row.url), [reviewVideo]);
+  assert.equal(grab.rows.find(row => row.url === reviewThumb).type, 'IMAGE');
+  grab.stopWatching();
+});
+
+test('extensionless review sources need an explicit video field or media MIME', () => {
+  const f = reviewFixture(), win = f.doc.defaultView;
+  const hinted = reviewRoot + 'transcode/source?signature=whole', unhinted = reviewRoot + 'transcode/untyped';
+  const stream = reviewRoot + 'transcode/playlist?signature=full';
+  win.__INITIAL_STATE__ = { rows: [
+    { videoUrl: hinted }, { url: unhinted },
+    { src: stream, type: 'application/vnd.apple.mpegurl' },
+    { videoUrl: reviewThumb }, { videoUrl: 'https://video.coupangcdn.com.evil.example/cloud/PRODUCTREVIEW/x.mp4' }
+  ] };
+  const grab = f.run();
+  assert.deepEqual(Array.from(grab.videos, row => [row.type, row.url]), [['VIDEO', hinted], ['STREAM', stream]]);
+  assert.ok(!grab.urls.includes(unhinted));
+  grab.stopWatching();
+});
+
+test('a literal entity in a JSON media URL stays unchanged instead of generating another signed URL', () => {
+  const f = reviewFixture(), exact = reviewRoot + 'transcode/file.mp4?signature=literal&amp;key=unchanged';
+  f.doc.defaultView.__NEXT_DATA__ = { videoUrl: exact };
+  const grab = f.run();
+  assert.deepEqual(Array.from(grab.videos, row => row.url), [exact]);
+  grab.stopWatching();
+});
+
+test('a newly inserted review JSON script is observed without opening its video', () => {
+  const f = reviewFixture(), grab = f.run();
+  const script = f.element('script', { attrs: { type: 'application/json' } });
+  script.textContent = JSON.stringify({ videoUrl: reviewVideo });
+  f.doc.body.append(script);
+  f.mutations[0].callback([{ target: f.doc.body, addedNodes: [script], removedNodes: [] }]);
+  assert.deepEqual(Array.from(grab.videos, row => row.url), [reviewVideo]);
+  assert.equal(grab.pendingVideos.length, 0);
+  grab.stopWatching();
+});
+
+test('review fetch observation preserves the original Promise, Response and body', async () => {
+  const f = reviewFixture(), win = f.doc.defaultView;
+  const body = JSON.stringify({ reviews: [{ videoUrl: reviewVideo }] });
+  const response = new Response(body, { headers: { 'Content-Type': 'application/json' } });
+  const promise = Promise.resolve(response), calls = [];
+  const original = function (...args) { calls.push({ receiver: this, args }); return promise; };
+  win.fetch = original;
+  const grab = f.run();
+  const options = { method: 'GET', headers: { 'X-Test': 'unchanged' } };
+  const result = win.fetch('/api/reviews?productId=1', options);
+  assert.equal(result, promise);
+  assert.equal(await result, response);
+  assert.equal(await response.text(), body);
+  await grab.collectReviewVideos({ refresh: false });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].receiver, win);
+  assert.equal(calls[0].args[1], options);
+  assert.deepEqual(Array.from(grab.videos, row => row.url), [reviewVideo]);
+  assert.equal(grab.reviewCollection.pendingResponses, 0);
+  grab.stopWatching();
+  assert.equal(win.fetch, original);
+});
+
+test('initial automatic collection re-reads only an observed Coupang review list GET', async () => {
+  const page = 'https://www.coupang.com/vp/products/123?vendorItemId=456';
+  const endpoint = 'https://www.coupang.com/vp/product/reviews?productId=123&page=1';
+  const f = reviewFixture({ documentURL: page, baseURI: page, resources: [{ name: endpoint, initiatorType: 'xmlhttprequest' }] });
+  const calls = [];
+  f.doc.defaultView.fetch = async (href, options) => {
+    calls.push({ href, options });
+    return new Response(`<div data-src=&quot;${reviewVideo.replaceAll('&', '&amp;')}&quot;></div>`,
+      { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  };
+  const grab = f.run();
+  await grab.ready;
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].href, endpoint);
+  assert.equal(calls[0].options.method, 'GET');
+  assert.equal(calls[0].options.credentials, 'same-origin');
+  assert.deepEqual(Array.from(grab.videos, row => row.url), [reviewVideo]);
+  assert.equal(grab.pendingVideos.length, 0);
+  assert.equal(grab.reviewCollection.refreshing, false);
+  grab.stopWatching();
+});
+
+test('unknown request methods, cross-origin and action endpoints are never replayed', async () => {
+  const f = reviewFixture({ resources: [
+    { name: url('/api/reviews'), initiatorType: 'fetch' },
+    { name: 'https://other.example/api/reviews', initiatorType: 'fetch' },
+    { name: url('/api/reviews/delete'), initiatorType: 'fetch' }
+  ] });
+  const calls = [];
+  f.doc.defaultView.fetch = (...args) => { calls.push(args); return Promise.resolve(new Response('{}', { headers: { 'Content-Type': 'application/json' } })); };
+  const grab = f.run(); await grab.ready;
+  await grab.collectReviewVideos();
+  assert.equal(calls.length, 0);
+  await f.doc.defaultView.fetch('/api/reviews', { method: 'POST', body: 'original request' });
+  await grab.collectReviewVideos();
+  assert.equal(calls.length, 1);
+  assert.equal(grab.pendingVideos.length, 1);
+  assert.equal(grab.videos.length, 0);
+  grab.stopWatching();
+});
+
+test('manual refresh uses the exact observed GET URL and skips it once an original is found', async () => {
+  const f = reviewFixture(), win = f.doc.defaultView, calls = [];
+  let body = '{}';
+  win.fetch = async (href, options) => { calls.push({ href, options }); return new Response(body, { headers: { 'Content-Type': 'application/json' } }); };
+  const grab = f.run(); await grab.ready;
+  const endpoint = '/api/reviews/list?productId=1&filter=video';
+  await win.fetch(endpoint, { method: 'GET' });
+  body = JSON.stringify({ videoUrl: reviewVideo });
+  await grab.collectReviewVideos();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].href, url(endpoint));
+  assert.deepEqual(Array.from(grab.videos, row => row.url), [reviewVideo]);
+  await grab.collectReviewVideos();
+  assert.equal(calls.length, 2);
+  grab.stopWatching();
+});
+
+test('accessor and inherited POST methods are not read again or mistaken for replayable GET requests', async () => {
+  const f = reviewFixture(), win = f.doc.defaultView, methods = [];
+  let getterReads = 0;
+  win.fetch = async (href, options) => {
+    methods.push(options.method);
+    return new Response('{}', { headers: { 'Content-Type': 'application/json' } });
+  };
+  const grab = f.run(); await grab.ready;
+  const accessor = { get method() { getterReads++; return 'POST'; } };
+  for (const options of [accessor, Object.create({ method: 'POST' })]) {
+    await win.fetch('/api/reviews', options);
+    await grab.collectReviewVideos();
+  }
+  assert.deepEqual(methods, ['POST', 'POST']);
+  assert.equal(getterReads, 1);
+  assert.equal(grab.reviewCollection.observedLists, 0);
+  grab.stopWatching();
+});
+
+test('failed review list refresh is reported while the JPEG and unresolved review remain intact', async () => {
+  const page = 'https://www.coupang.com/vp/products/123';
+  const endpoint = 'https://www.coupang.com/vp/product/reviews?productId=123';
+  const f = reviewFixture({ documentURL: page, baseURI: page, resources: [{ name: endpoint, initiatorType: 'fetch' }] });
+  f.doc.defaultView.fetch = async () => new Response('denied', { status: 403, headers: { 'Content-Type': 'text/html' } });
+  const grab = f.run(); await grab.ready;
+  assert.equal(grab.videos.length, 0);
+  assert.equal(grab.pendingVideos.length, 1);
+  assert.equal(grab.reviewCollection.errors[0].url, endpoint);
+  assert.match(grab.reviewCollection.errors[0].message, /403/);
+  assert.ok(grab.getManifest().items.some(row => row.url === reviewThumb && row.type === 'IMAGE'));
+  grab.stopWatching();
+});
+
+test('oversized streamed review responses stop metadata collection without consuming the page body', async () => {
+  const f = reviewFixture(), win = f.doc.defaultView;
+  const body = ' '.repeat(2 * 1024 ** 2 + 1) + JSON.stringify({ videoUrl: reviewVideo });
+  const response = new Response(body, { headers: { 'Content-Type': 'application/json' } });
+  win.fetch = () => Promise.resolve(response);
+  const grab = f.run();
+  await win.fetch('/api/reviews');
+  const consumed = response.text();
+  await grab.collectReviewVideos({ refresh: false });
+  assert.equal(await consumed, body);
+  assert.equal(grab.videos.length, 0);
+  assert.ok(grab.reviewCollection.limitsReached.includes('review.fetch'));
+  grab.stopWatching();
+});
+
+function installXHR(win) {
+  win.XMLHttpRequest = class {
+    constructor() { this.listeners = new Map(); this.responseType = ''; this.status = 200; }
+    open(method, href) { this.method = method; this.href = href; return 'open result'; }
+    send(body) { this.body = body; return 'send result'; }
+    addEventListener(name, callback) { this.listeners.set(name, callback); }
+    removeEventListener(name, callback) { if (this.listeners.get(name) === callback) this.listeners.delete(name); }
+    finish() { this.listeners.get('loadend')?.(); }
+  };
+  return { open: win.XMLHttpRequest.prototype.open, send: win.XMLHttpRequest.prototype.send };
+}
+
+test('XHR review JSON and text responses are read without changing request arguments or playback', () => {
+  const f = reviewFixture(), win = f.doc.defaultView, original = installXHR(win);
+  const grab = f.run(), first = new win.XMLHttpRequest();
+  first.responseType = 'json'; first.response = { videoUrl: reviewVideo };
+  assert.equal(first.open('GET', '/api/reviews'), 'open result');
+  assert.equal(first.send(null), 'send result');
+  assert.equal(first.body, null);
+  first.finish();
+  const second = new win.XMLHttpRequest();
+  second.responseText = JSON.stringify({ videoUrl: reviewRoot + 'transcode/source.webm' });
+  second.open('POST', '/api/reviews'); second.send('unmodified body'); second.finish();
+  assert.equal(second.body, 'unmodified body');
+  assert.equal(grab.videos.length, 2);
+  assert.equal(grab.pendingVideos.length, 0);
+  assert.equal(first.listeners.size, 0);
+  grab.stopWatching();
+  assert.equal(win.XMLHttpRequest.prototype.open, original.open);
+  assert.equal(win.XMLHttpRequest.prototype.send, original.send);
+});
+
+test('stopping observation ignores late responses and preserves other subsequently installed fetch wrappers', async () => {
+  const f = reviewFixture(), win = f.doc.defaultView;
+  let resolveResponse;
+  win.fetch = () => new Promise(resolve => { resolveResponse = resolve; });
+  const grab = f.run();
+  const response = win.fetch('/api/reviews');
+  const nextWrapper = () => 'next wrapper'; win.fetch = nextWrapper;
+  grab.stopWatching();
+  resolveResponse(new Response(JSON.stringify({ videoUrl: reviewVideo }), { headers: { 'Content-Type': 'application/json' } }));
+  await response; await grab.collectReviewVideos({ refresh: false });
+  assert.equal(win.fetch, nextWrapper);
+  assert.equal(grab.videos.length, 0);
+});
+
+test('unfinished page requests have a bounded wait and remain explicitly pending', async () => {
+  const f = reviewFixture(), win = f.doc.defaultView;
+  let resolveResponse, deadline;
+  win.fetch = () => new Promise(resolve => { resolveResponse = resolve; });
+  const grab = f.run(); await grab.ready;
+  const original = win.fetch('/api/reviews');
+  win.setTimeout = callback => { deadline = callback; return 1; };
+  win.clearTimeout = () => {};
+  const collecting = grab.collectReviewVideos({ refresh: false });
+  deadline();
+  const result = await collecting;
+  assert.equal(result.pendingResponses, 1);
+  assert.equal(result.pendingVideos.length, 1);
+  resolveResponse(new Response('{}', { headers: { 'Content-Type': 'application/json' } }));
+  await original;
+  grab.stopWatching();
+});
+
+test('real HTTP review JSON is captured before the page consumes it without requesting a video', async () => {
+  const http = require('node:http'), requests = [];
+  const body = JSON.stringify({ reviews: [{ videoUrl: reviewVideo, thumbnailUrl: reviewThumb }] });
+  const server = http.createServer((request, response) => {
+    requests.push([request.method, request.url]);
+    response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(body);
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  let grab;
+  try {
+    const f = reviewFixture({ documentURL: origin + '/product', baseURI: origin + '/product' });
+    f.doc.defaultView.fetch = fetch;
+    grab = f.run(); await grab.ready;
+    const request = new Request(origin + '/api/reviews?productId=1');
+    const response = await f.doc.defaultView.fetch(request);
+    assert.deepEqual(await response.json(), JSON.parse(body));
+    await grab.collectReviewVideos({ refresh: false });
+    assert.deepEqual(Array.from(grab.videos, row => row.url), [reviewVideo]);
+    assert.equal(grab.pendingVideos.length, 0);
+    assert.deepEqual(requests, [['GET', '/api/reviews?productId=1']]);
+  } finally {
+    grab?.stopWatching(); server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
 
 test('YouTube iframe is collected with a video ID even when its document is cross-origin', () => {
   const f = fixture();
