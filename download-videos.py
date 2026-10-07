@@ -97,9 +97,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         jobs, page_url, pending = load_videos(args.manifest)
         if pending:
-            print(f"주의: 아직 썸네일만 확인된 리뷰 영상 {pending}개가 있습니다. 재생 후 목록을 다시 내보내세요.")
+            print(f"원본 주소를 확인하지 못한 리뷰 영상 {pending}개가 있습니다. mediaGrab.collectReviewVideos() 결과를 확인하세요.")
         if not jobs:
-            print("영상 주소가 없습니다. 최신 수집 코드를 실행하고 리뷰 영상을 재생한 뒤 mediaGrab.export() 하세요.")
+            print("영상 주소가 없습니다. 최신 수집 코드에서 await mediaGrab.collectReviewVideos() 후 mediaGrab.export() 하세요.")
             return 1
         if importlib.util.find_spec("yt_dlp") is None:
             print('yt-dlp를 설치하세요: python -m pip install -U "yt-dlp[default]"', file=sys.stderr)

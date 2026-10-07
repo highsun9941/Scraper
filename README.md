@@ -7,7 +7,8 @@
 Windows 기본 PowerShell로 목록에 있는 파일을 일괄 다운로드할 수 있습니다. **추가 설치는 필요하지 않습니다.**
 브라우저에서 읽을 수 있는 원본 파일은 콘솔 명령으로 ZIP에 묶어 다운로드하는 방식도 지원합니다.
 Python 다운로드 도구는 선택 사항입니다.
-유튜브 임베드는 `EMBED`로 기록합니다. 리뷰 재생창의 동적 영상 주소는 스크립트 실행 후 자동 감시합니다.
+유튜브 임베드는 `EMBED`로 기록합니다. 쿠팡 리뷰는 페이지 데이터와 리뷰 목록 응답에 있는 원본 영상 주소를 **재생 없이** 수집합니다.
+재생창의 동적 영상 주소도 스크립트 실행 후 자동 감시합니다.
 
 ## 윈도우에서 실행하기
 
@@ -20,7 +21,8 @@ Python 다운로드 도구는 선택 사항입니다.
 
 `collect-page-media.js`는 상품 페이지 안에서 실행하는 코드입니다. 실행할 페이지의 `window`와 `document`를 사용합니다.
 한 번 실행하면 `window.mediaGrab`에 결과와 재수집 함수가 생깁니다.
-리뷰 영상은 **코드를 먼저 실행하고 나서 각 영상을 재생**하세요. 팝업을 닫아도 발견한 주소는 보존합니다.
+필요한 리뷰 목록을 열고 스크롤해 데이터를 로딩한 뒤 실행하세요. **영상의 재생 버튼을 누를 필요는 없습니다.**
+초기 자동 수집을 기다리려면 `await mediaGrab.ready`를 실행합니다. 발견한 주소는 팝업을 닫아도 보존합니다.
 
 ## Windows PowerShell로 일괄 다운로드하기 (추가 설치 없음)
 
@@ -84,7 +86,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\download-media.ps1" -
 - `.m3u8`·`.mpd`는 재생목록만 저장합니다. 영상 조각 병합·DRM 처리는 지원하지 않습니다.
 - 서버 접속 제한과 만료된 주소는 실패 기록에 남기고 다음 파일로 진행합니다. 일부 주소가 실패해도 나머지 다운로드는 계속합니다.
 
-## 유튜브 임베드와 클릭해야 나타나는 리뷰 영상
+## 유튜브 임베드와 재생 없이 수집하는 리뷰 영상
 
 유튜브 iframe의 내부 문서를 읽을 수 없어도 부모 페이지의 `src`, `data-src` 등을 읽어 영상 ID와 시청 주소를 수집합니다.
 `type: "EMBED"`, `provider: "youtube"`, `videoId`, `embedUrl`을 기록하며 같은 영상 ID는 한 번만 수집합니다.
@@ -94,28 +96,48 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\download-media.ps1" -
 이 이미지를 MP4로 이름만 바꾸거나 경로에서 영상 URL을 추측하지 않습니다.
 대신 썸네일만 확인된 리뷰를 `pendingVideos`로 알리고, 원본 주소가 확인되면 목록에서 제거합니다.
 
-1. 상품 상세를 펼치고 최신 `collect-page-media.js` 전체를 콘솔에서 실행합니다. 영상 감시는 자동으로 시작합니다.
-2. 영상 리뷰를 하나씩 눌러 실제 재생합니다. 재생기·DOM·네트워크에서 원본 주소를 읽으며, 팝업을 닫아도 기록을 보존합니다.
-3. 다음 명령으로 결과를 확인하고 목록을 내보냅니다.
+1. 상품 상세와 필요한 리뷰 목록을 펼친 뒤 최신 `collect-page-media.js` 전체를 콘솔에서 실행합니다.
+2. `await mediaGrab.ready`로 초기 자동 수집을 기다립니다. 데이터에 원본 주소가 있으면 영상 리뷰를 재생하지 않아도 수집합니다.
+3. 실행 후 리뷰 목록을 더 열거나 스크롤했다면 아래 명령으로 다시 확인하고 목록을 내보냅니다.
 
    ```js
-   mediaGrab.scan()
+   await mediaGrab.collectReviewVideos()
    console.table(mediaGrab.videos)        // 원본 영상, 재생목록, 유튜브 시청 주소
    console.table(mediaGrab.pendingVideos) // 썸네일만 확인된 리뷰
    mediaGrab.export()
    ```
+
+수집기는 JSON 스크립트·페이지 초기 데이터·썸네일 주변의 데이터 속성과 읽을 수 있는 React props/state를 확인합니다.
+React 내부 필드는 공개 API가 아니므로 없거나 구조가 바뀌면 건너뜁니다. 페이지의 getter, 이벤트 핸들러나 재생 함수를 호출하지 않습니다.
+실행 이후 페이지가 받는 같은 출처의 리뷰 `fetch`·XHR 응답도 읽습니다. `fetch` 본문은 복제해서 읽고 페이지에 원래 Promise와 Response를 돌려줍니다.
+
+원본 미확인 리뷰가 있으면 **이미 관찰한 리뷰 목록 GET 주소**를 그대로 재조회합니다. 새로운 API 경로를 추측하거나 리뷰를 자동 클릭하지 않습니다.
+과거 Resource Timing에는 요청 메서드가 없으므로 쿠팡의 `/vp/product/reviews` 목록 경로만 GET 재조회 후보로 사용하며,
+그 외 목록 경로는 코드 실행 후 실제 GET 요청을 관찰한 경우에만 재조회합니다. POST 요청은 반복하지 않습니다.
+재조회에는 같은 출처의 브라우저 세션을 사용하고 새 헤더·요청 본문을 만들지 않습니다. 별도 인증 헤더가 필요한 응답은 실패할 수 있습니다.
+이미 로딩된 리뷰만 다루며, 전체 리뷰 페이지를 자동으로 순회하지는 않습니다.
+
+**서버가 썸네일만 제공하고 원본 주소는 재생할 때만 보낸다면 재생 없이 수집할 수 없습니다.**
+그 경우 `pendingVideos`에 남습니다. `mediaGrab.reviewCollection`에서 응답 대기·재조회 오류·크기 제한을 확인할 수 있습니다.
+리뷰 응답과 스크립트는 2 MiB까지 읽고, 데이터 탐색은 깊이 20·값 20,000개로 제한합니다.
+한 번에 최대 8개 목록을 재조회하며 요청당 8초, 응답 대기 8초를 적용합니다. 제한에 걸린 데이터를 모두 읽었다고 표시하지 않습니다.
+실제 쿠팡 상품 페이지의 최신 응답 구조는 접근 가능한 브라우저에서 별도로 확인해야 합니다.
 
 `export()`와 `download()`는 처리 전에 현재 페이지를 다시 수집합니다.
 `visibleOnly: true`는 닫힌 팝업의 영상 주소를 제외할 수 있으므로 리뷰 영상 수집에는 기본 옵션을 사용하세요.
 
 | 명령 | 동작 |
 |---|---|
+| `await mediaGrab.ready` | 초기 페이지 데이터 검사와 자동 목록 재조회 결과 대기 |
+| `await mediaGrab.collectReviewVideos()` | 현재 데이터 재검사, 필요한 관찰된 GET 목록 재조회, 진행 중인 응답 대기 |
+| `await mediaGrab.collectReviewVideos({refresh:false})` | 추가 요청 없이 현재 데이터와 진행 중인 리뷰 응답만 확인 |
 | `mediaGrab.embeds` | 유튜브 임베드에서 확인한 시청 주소 |
 | `mediaGrab.videos` | 임시 blob을 제외한 `VIDEO`, `STREAM`, `EMBED` |
 | `mediaGrab.pendingVideos` | 원본 주소를 확인하지 못한 쿠팡 리뷰 썸네일 |
+| `mediaGrab.reviewCollection` | 진행 중인 리뷰 응답·목록 재조회 오류·탐색 제한 |
 | `mediaGrab.watching` | 자동 영상 감시 상태 |
-| `mediaGrab.stopWatching()` | 이벤트·DOM·네트워크 관찰과 재생기 폴링 종료 |
-| `mediaGrab.watch()` | 감시 재시작. 새 네트워크 요청이나 자동 클릭은 하지 않음 |
+| `mediaGrab.stopWatching()` | 이벤트·DOM·네트워크 관찰과 폴링 종료, 수집기가 설치한 fetch·XHR 관찰 해제 |
+| `mediaGrab.watch()` | 감시와 초기 자동 수집 재시작 |
 
 유튜브 시청 주소는 영상 파일이 아닙니다. 브라우저 ZIP과 기존 Python·PowerShell 도구는
 번호가 붙은 `.url` 바로가기와 `link` 상태를 남깁니다. 영상 파일 저장에는 아래 도구를 사용합니다.
@@ -132,7 +154,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\download-media.ps1" -
    ```
 
 2. 저장소의 `download-videos.py`와 `download-videos.cmd`를 같은 폴더에 둡니다.
-3. 리뷰를 재생한 뒤 다시 내보낸 `media-manifest.json`을 **`download-videos.cmd` 위로 드래그**합니다.
+3. 위 명령으로 수집하고 내보낸 `media-manifest.json`을 **`download-videos.cmd` 위로 드래그**합니다.
    또는 명령 프롬프트에서 실행합니다.
 
    ```bat
@@ -148,7 +170,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\download-media.ps1" -
 YouTube 지원은 최신 yt-dlp와 지원되는 JavaScript 실행기(예: Deno 또는 Node.js)에 의존합니다.
 설치된 Node.js가 있으면 `--js-runtimes node`를 전달합니다.
 고화질 분리 트랙 병합에는 FFmpeg가 필요할 수 있습니다. [yt-dlp 공식 설치·의존성 안내](https://github.com/yt-dlp/yt-dlp#installation)를 참고하세요.
-브라우저 쿠키를 읽거나 로그인 제한을 통과하는 기능은 없으며, 서명 주소가 만료되면 재생 후 목록을 다시 내보내세요.
+브라우저 쿠키를 읽거나 로그인 제한을 통과하는 기능은 없으며, 서명 주소가 만료되면 최신 리뷰 데이터를 수집해 목록을 다시 내보내세요.
 
 ## 리뷰 영상이 blob 주소로만 잡힐 때
 
@@ -162,7 +184,7 @@ Video.js 재생기는 DOM 영상 주소와 별도로 원본 소스를 보관할 
 재생기를 새로 만들거나 재생·소스 변경 명령을 실행하지 않습니다.
 
 1. 최신 `collect-page-media.js`의 **전체 코드로 스니펫을 교체**합니다.
-2. 리뷰 영상 창을 열고 재생한 뒤, 창을 열어 둔 상태에서 새 수집 코드를 실행합니다. 이미 새 코드를 실행했다면 재생 후 `mediaGrab.scan()`을 실행합니다.
+2. 먼저 `await mediaGrab.collectReviewVideos()`로 원본 주소를 확인합니다. 페이지 데이터에 주소가 없다면, 직접 재생하기로 선택한 영상의 열린 재생창에서 `mediaGrab.scan()`으로 재생기 소스를 확인할 수도 있습니다.
 3. 아래 명령으로 브라우저 밖에서도 사용할 수 있는 영상·재생목록 주소를 확인하고, 전체 URL을 클립보드에 복사합니다.
 
    ```js
@@ -376,6 +398,7 @@ copy(mediaGrab.rows.filter(x => ['VIDEO', 'STREAM'].includes(x.type)).map(x => x
 - `picture > source`, SVG의 외부 `image` 주소, 이미지형 `input`, 이미지·영상형 `object`/`embed`
 - CSS 배경·마스크·테두리·목록 이미지와 `::before`/`::after`의 이미지 주소
 - `video`/`source`의 영상 주소와 `video.poster`, 접근 가능한 Video.js 재생기의 원본 소스
+- 쿠팡 리뷰의 JSON·초기 데이터·주변 React 데이터와 같은 출처의 리뷰 목록 응답에 있는 원본 영상 주소
 - 미디어 파일을 직접 가리키는 링크 및 일부 `data-*` 이미지·영상 속성
 - 접근 가능한 iframe과 열린 Shadow DOM
 - Resource Timing에 기록된 미디어 주소
@@ -415,6 +438,8 @@ node --test tests/media-order.test.cjs
 
 수집·ZIP 자동 테스트로 로딩·DOM 순서와 다른 좌표 정렬, 700개 주소의 보존과 정렬, 반응형 이미지 후보, 숨긴 복제본, 재수집, 스크롤, CSS·GIF·영상, Shadow DOM, iframe 좌표·접근 상태와 위치 계산 실패를 확인했습니다.
 유튜브 iframe의 교차 출처·지연 로딩·영상 ID 중복 제거·유사 도메인 제외, 리뷰 썸네일의 미수집 진단, 자동 이벤트·DOM·네트워크 감시, 팝업 제거 후 보존, 감시기 해제와 외부 영상 `.url` 저장도 모의 환경에서 검증합니다.
+재생 없는 리뷰 수집은 초기 JSON·React 상태·지연 스크립트·서명 URL 보존·확장자 없는 소스 구분·관찰된 GET 목록 재조회·POST 재전송 방지·403·크기 제한·응답 대기 제한·관찰 해제를 확인했습니다.
+실제 로컬 HTTP 리뷰 응답을 페이지에서 정상 소비하면서 같은 원본 영상 URL을 수집하는 사례도 포함합니다. 쿠팡 서버의 실제 응답 구조에서의 성공을 검증한 것은 아닙니다.
 영상 전용 다운로드 도구는 URL 분류, 순번·서명 보존, subprocess 인자 전달, 결과 파일 확인, 실패 기록을 검증합니다. 실제 YouTube 다운로드는 이 환경에서 검증하지 못했습니다.
 SVG 내부 참조 제외는 절대 주소·CSS 이스케이프·별도의 base URI·iframe 문서에서 검증했으며, 외부 SVG 및 data 이미지 주소는 유지합니다.
 Mercury 이벤트 주소 제외는 네트워크·DOM·CSS 경로와 재수집에서 검증했습니다. 392개 이미지 후보와 CSS GIF 한 개를 보존하면서 이벤트 주소 67개를 분리하는 모의 사례와, 일반 GIF를 fetch/XHR로 수집하는 사례도 포함합니다.
