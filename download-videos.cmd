@@ -1,6 +1,7 @@
 @echo off
 if "%~1"=="" (
-  echo Drag media-manifest.json onto this file after playing the review videos.
+  echo Drag media-manifest.json or download-report.json / CSV onto this file.
+  echo HLS / DASH to MP4 requires ffmpeg.exe and ffprobe.exe in this folder or on PATH.
   pause
   exit /b 1
 )
