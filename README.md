@@ -9,6 +9,7 @@ Windows 기본 PowerShell로 목록에 있는 파일을 일괄 다운로드할 �
 Python 다운로드 도구는 선택 사항입니다.
 유튜브 임베드는 `EMBED`로 기록합니다. 쿠팡 리뷰는 페이지 데이터와 리뷰 목록 응답에 있는 원본 영상 주소를 **재생 없이** 수집합니다.
 재생창의 동적 영상 주소도 스크립트 실행 후 자동 감시합니다.
+H.264·AAC TS 방식의 HLS 리뷰 영상은 콘솔에서 `await mediaGrab.downloadHls()`로 MP4 ZIP에 저장할 수 있습니다. Python이나 FFmpeg 실행 파일을 설치할 필요가 없습니다.
 
 ## 윈도우에서 실행하기
 
@@ -142,7 +143,51 @@ React 내부 필드는 공개 API가 아니므로 없거나 구조가 바뀌면 
 유튜브 시청 주소는 영상 파일이 아닙니다. 브라우저 ZIP과 기존 Python·PowerShell 도구는
 번호가 붙은 `.url` 바로가기와 `link` 상태를 남깁니다. 영상 파일 저장에는 아래 도구를 사용합니다.
 
-## m3u8·mpd를 재생 가능한 MP4로 저장하기
+## 설치 없이 콘솔에서 m3u8 리뷰 영상을 MP4로 저장하기
+
+완료된 HLS 영상의 재생목록과 TS 조각을 브라우저에서 읽고, 포함된 mux.js 코드로 MP4에 담아 ZIP으로 저장합니다.
+영상·음성을 재인코딩하거나 재생하지 않습니다. `ffmpeg.exe`, `ffprobe.exe`, Python은 필요하지 않습니다.
+병합 코드는 `collect-page-media.js` 안에 포함돼 있으므로 외부 라이브러리·Worker·WASM을 실행 시 다운로드하지 않습니다.
+버전·출처·라이선스는 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)에 기록합니다.
+
+1. 필요한 리뷰 목록을 로딩하고 최신 `collect-page-media.js` 전체를 상품 페이지 콘솔에 붙여 넣습니다.
+2. 초기 수집을 기다린 뒤 HLS 영상을 저장합니다.
+
+   ```js
+   await mediaGrab.ready
+   await mediaGrab.downloadHls()
+   ```
+
+3. 저장된 `page-media-날짜-시간-001.zip`을 풉니다. 전체 수집 목록의 순번을 유지한 `0121.mp4` 같은 파일과 다운로드 보고서가 들어 있습니다.
+4. 이미지·GIF는 기존처럼 `mediaGrab.export()`로 목록을 내보내 `download-media-powershell.cmd`에 드래그해서 받으면 됩니다. HLS 영상에 `download-videos.cmd`를 추가로 실행할 필요는 없습니다.
+
+지원 범위는 **하나의 목록에 영상·음성이 함께 있는 H.264·AAC TS 방식의 VOD**입니다. 무음 영상도 지원합니다.
+중첩된 마스터 목록에서는 지원하는 코덱·트랙 중 높은 대역폭의 변형을 선택하고, 상대 조각 주소는 원본 서버 주소를 기준으로 읽습니다.
+암호화, 라이브, 별도 음성 목록, fMP4 조각, 바이트 범위, 중간 코덱·트랙 변경, DASH·유튜브는 이 기능의 대상이 아닙니다.
+지원하지 않거나 조각 요청이 실패하면 `failed`로 기록하고 다음 영상으로 진행합니다. 일부 조각만 만든 MP4는 ZIP에 넣지 않습니다.
+
+**원본 목록과 모든 TS 조각을 서버가 브라우저에 읽도록 허용해야 합니다(CORS).**
+페이지에서 재생된다는 사실만으로 콘솔 `fetch()`도 읽을 수 있는 것은 아닙니다.
+서버가 허용하지 않거나 CSP·접속 제한으로 막히면 `failed.csv`에 기록합니다. 콘솔 코드로 브라우저 보안 제한을 해제하지 않습니다.
+TS 패킷·MP4 트랙 구조를 확인하지만 브라우저에서 파일 전체를 디코딩하는 검사는 수행하지 않습니다.
+일반 MP4 파일과 달리 출력은 fragmented MP4이므로 플레이어에 따라 탐색 기능이 다를 수 있습니다.
+
+기본 한 영상의 TS 입력·MP4 출력 크기 제한은 각각 256 MiB, 요청 제한은 30초입니다.
+HLS 목록은 최대 2 MiB, 중첩은 5개, 한 영상의 TS 조각은 1,000개까지입니다.
+`await mediaGrab.downloadHls({maxFileMB:512, timeoutMs:60000})`로 파일·요청 제한을 조절할 수 있습니다.
+중단은 `mediaGrab.stopDownload()`, 저장 재요청은 `mediaGrab.saveArchive(1)`을 사용합니다.
+진행 결과는 `mediaGrab.lastDownload`에서 확인합니다. 여기의 `packed`는 ZIP에 MP4 바이트를 넣었다는 뜻입니다.
+
+이미지와 지원하는 HLS까지 한 ZIP으로 받고 싶으면 아래처럼 실행합니다. 이미지에도 브라우저 CORS 제한이 적용됩니다.
+
+```js
+await mediaGrab.download({hls:"mp4"})
+```
+
+기존 `await mediaGrab.download()`의 기본 동작은 재생목록 저장을 유지합니다.
+콘솔에서 읽을 수 없는 원본이나 위 지원 범위 밖의 스트림은 아래 FFmpeg 방식으로 받을 수 있습니다.
+
+## 선택: FFmpeg로 m3u8·mpd를 MP4로 저장하기
 
 `download-videos.py`는 수집 목록과 다운로드 보고서에서 영상 주소만 선택합니다.
 이미지와 미확인 리뷰 썸네일은 영상 주소로 취급하지 않습니다.
