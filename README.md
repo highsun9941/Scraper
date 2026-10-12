@@ -1,7 +1,5 @@
 # Scraper
 
-Browser-console media collector for product pages: export ordered image, GIF, and video URLs, download ZIPs, and merge HLS to MP4 without installation.
-
 쇼핑 상품 페이지에서 이미지·GIF·동영상 주소를 수집하는 브라우저 콘솔 스크립트입니다.
 페이지의 DOM, CSS 이미지 주소와 현재 남아 있는 Resource Timing 항목을 읽고, 정확히 같은 URL을 중복 제거합니다.
 페이지 내부 SVG 참조와 확인된 통계·이벤트 주소는 미디어 목록에서 제외합니다.
