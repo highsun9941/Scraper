@@ -1168,11 +1168,22 @@
     },
     export(options = {}) {
       const manifest = this.getManifest(options);
+      let site = "";
+      try { site = new URL(manifest.pageUrl).hostname.replace(/^www\./i, ""); } catch {}
+      // 상품명·URL 쿼리 대신 사이트 도메인을 사용하고, 파일명에 경로 문자를 허용하지 않습니다.
+      const requested = typeof options.filename === "string" && options.filename.trim()
+        ? options.filename.trim().replace(/\.json$/i, "") : site;
+      let name = (requested || "media-manifest").trim()
+        .replace(/[<>:"/\\|?*\u0000-\u001f\u007f]/g, "_").replace(/^[. ]+|[. ]+$/g, "");
+      // 긴 도메인과 사용자 지정 이름도 확장자를 포함해 파일명 길이 제한 안에 둡니다.
+      name = Array.from(name).slice(0, 60).join("").replace(/[. ]+$/g, "") || "media-manifest";
+      if (/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name)) name = `_${name}`;
+      const filename = `${name}.json`;
       if (manifest.reviewCollection.refreshing || manifest.reviewCollection.pendingResponses) console.log("리뷰 응답 수집 중입니다. await mediaGrab.collectReviewVideos() 후 다시 내보내면 최신 결과를 포함합니다.");
       const blob = new Blob([JSON.stringify(manifest, null, 2)], { type: "application/json;charset=utf-8" });
       const href = URL.createObjectURL(blob), link = document.createElement("a");
       link.href = href;
-      link.download = "media-manifest.json";
+      link.download = filename;
       link.style.display = "none";
       (document.body || document.documentElement).appendChild(link);
       try { link.click(); }
@@ -1180,8 +1191,8 @@
         link.remove();
         setTimeout(() => URL.revokeObjectURL(href), 60000);
       }
-      console.log(`주소 ${manifest.items.length}개의 목록 파일 저장을 요청했습니다: media-manifest.json`);
-      return { filename: "media-manifest.json", count: manifest.items.length, visibleOnly: manifest.visibleOnly };
+      console.log(`주소 ${manifest.items.length}개의 목록 파일 저장을 요청했습니다: ${filename}`);
+      return { filename, count: manifest.items.length, visibleOnly: manifest.visibleOnly };
     },
     scan({ quiet = false } = {}) {
       styles = new WeakMap(); layouts = new WeakMap(); elementOrder = 0;

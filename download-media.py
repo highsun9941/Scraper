@@ -213,7 +213,7 @@ def write_reports(folder: Path, results: list[dict]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="수집한 주소를 원본 파일로 일괄 다운로드합니다. Python 3.10+ 필요.")
-    parser.add_argument("manifest", type=Path, help="media-manifest.json 또는 한 줄에 URL 하나인 텍스트 파일")
+    parser.add_argument("manifest", type=Path, help="미디어 목록 JSON(예: coupang.com.json) 또는 한 줄에 URL 하나인 텍스트 파일")
     parser.add_argument("--output", type=Path, help="새로 만들 결과 폴더. 이미 존재하는 폴더에는 저장하지 않습니다.")
     parser.add_argument("--workers", type=int, default=4, help="동시 다운로드 수, 1~16 (기본 4)")
     parser.add_argument("--timeout", type=float, default=20, help="연결·읽기 대기 제한(초), 기본 20")

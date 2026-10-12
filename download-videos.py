@@ -49,7 +49,7 @@ def load_videos(path: Path) -> tuple[list[dict], str, int]:
     document = list(csv.DictReader(io.StringIO(text))) if path.suffix.lower() == ".csv" else json.loads(text)
     items = document.get("items", document.get("results")) if isinstance(document, dict) else document
     if not isinstance(items, list):
-        raise ValueError("media-manifest.json 또는 download-report.json·CSV의 목록이 필요합니다.")
+        raise ValueError("미디어 목록 JSON(예: coupang.com.json) 또는 download-report.json·CSV의 목록이 필요합니다.")
     jobs, seen, orders = [], set(), set()
     for index, item in enumerate(items, 1):
         if not isinstance(item, dict):
@@ -189,7 +189,7 @@ def download_video(job: dict, folder: Path, page_url: str, timeout: float, ffmpe
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="수집 목록·다운로드 보고서에서 영상을 저장합니다. STREAM은 FFmpeg로 MP4 병합, VIDEO·EMBED는 yt-dlp 사용. Python 3.10+ 필요.")
-    parser.add_argument("manifest", type=Path, help="media-manifest.json 또는 download-report.json·CSV")
+    parser.add_argument("manifest", type=Path, help="미디어 목록 JSON(예: coupang.com.json) 또는 download-report.json·CSV")
     parser.add_argument("--output", type=Path, help="새 결과 폴더. 이미 존재하는 폴더는 사용하지 않습니다.")
     parser.add_argument("--timeout", type=float, default=600, help="영상 한 개의 전체 시간 제한(초), 기본 600")
     parser.add_argument("--ffmpeg-location", type=Path, help="ffmpeg와 ffprobe가 있는 폴더 또는 ffmpeg 실행 파일 경로")
