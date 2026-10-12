@@ -927,6 +927,7 @@ test('JSON manifest preserves full ordered addresses and omits excluded events',
   f.doc.body.append(f.img(long, 500), f.img('/first.jpg', 10));
   const manifest = f.run().getManifest();
   assert.equal(manifest.schema, 'media-grab/1');
+  assert.equal(manifest.collectorVersion, '2026.10.12.1');
   assert.equal(manifest.pageUrl, base);
   assert.equal(manifest.title, '상품 테스트');
   assert.ok(Number.isFinite(Date.parse(manifest.exportedAt)));
@@ -976,6 +977,7 @@ test('export requests one JSON file and releases its temporary URL', async () =>
 test('export names manifests after the page hostname and safely handles custom filenames', () => {
   const cases = [
     { page: 'https://www.coupang.com/vp/products/123?token=secret', expected: 'coupang.com.json' },
+    { page: 'https://shop.coupang.com/kd1961/487603?source=brandstore_display_ads&adType=DA&eventId=example', expected: 'shop.coupang.com.json' },
     { page: 'https://shop.example.co.kr:8443/product#details', expected: 'shop.example.co.kr.json' },
     { page: 'https://store.json/product', expected: 'store.json.json' },
     { page: 'https://www.example.com/product', options: { visibleOnly: true }, expected: 'example.com.json' },
@@ -1002,7 +1004,9 @@ test('export names manifests after the page hostname and safely handles custom f
     f.context.setTimeout = () => {};
     f.doc.createElement = () => link;
     f.doc.body.appendChild = () => {};
-    const info = f.run().export(options);
+    const grab = f.run();
+    if (options.filename === undefined) assert.equal(grab.exportFilename, expected, page);
+    const info = grab.export(options);
     assert.equal(link.download, expected, page);
     assert.equal(info.filename, expected, page);
     assert.equal(info.visibleOnly, Boolean(options.visibleOnly));

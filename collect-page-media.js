@@ -797,6 +797,19 @@
     (document.body || document.documentElement).appendChild(link);
     try { link.click(); } finally { link.remove(); }
   };
+  const manifestFilename = (pageUrl, customFilename) => {
+    let site = "";
+    try { site = new URL(pageUrl).hostname.replace(/^www\./i, ""); } catch {}
+    // 상품명·URL 쿼리 대신 사이트 도메인을 사용하고, 파일명에 경로 문자를 허용하지 않습니다.
+    const requested = typeof customFilename === "string" && customFilename.trim()
+      ? customFilename.trim().replace(/\.json$/i, "") : site;
+    let name = (requested || "media-manifest").trim()
+      .replace(/[<>:"/\\|?*\u0000-\u001f\u007f]/g, "_").replace(/^[. ]+|[. ]+$/g, "");
+    // 긴 도메인과 사용자 지정 이름도 확장자를 포함해 파일명 길이 제한 안에 둡니다.
+    name = Array.from(name).slice(0, 60).join("").replace(/[. ]+$/g, "") || "media-manifest";
+    if (/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name)) name = `_${name}`;
+    return `${name}.json`;
+  };
   const reportCSV = rows => {
     const fields = ["order", "status", "filename", "bytes", "httpStatus", "contentType", "url", "message"];
     const quote = value => `"${String(value ?? "").replace(/"/g, '""')}"`;
@@ -990,6 +1003,8 @@
   };
   let downloadController = null, downloadReport = null;
   window.mediaGrab = {
+    version: "2026.10.12.1",
+    get exportFilename() { return manifestFilename(document.URL || document.location?.href || document.baseURI); },
     get rows() { return ordered(); },
     get urls() { return this.rows.map(r => r.url); },
     get visibleRows() { return this.rows.filter(r => r.visible); },
@@ -1156,6 +1171,7 @@
       this.scan({ quiet: true });
       return {
         schema: "media-grab/1",
+        collectorVersion: this.version,
         pageUrl: document.URL || document.location?.href || document.baseURI,
         title: document.title || "",
         exportedAt: new Date().toISOString(),
@@ -1168,17 +1184,7 @@
     },
     export(options = {}) {
       const manifest = this.getManifest(options);
-      let site = "";
-      try { site = new URL(manifest.pageUrl).hostname.replace(/^www\./i, ""); } catch {}
-      // 상품명·URL 쿼리 대신 사이트 도메인을 사용하고, 파일명에 경로 문자를 허용하지 않습니다.
-      const requested = typeof options.filename === "string" && options.filename.trim()
-        ? options.filename.trim().replace(/\.json$/i, "") : site;
-      let name = (requested || "media-manifest").trim()
-        .replace(/[<>:"/\\|?*\u0000-\u001f\u007f]/g, "_").replace(/^[. ]+|[. ]+$/g, "");
-      // 긴 도메인과 사용자 지정 이름도 확장자를 포함해 파일명 길이 제한 안에 둡니다.
-      name = Array.from(name).slice(0, 60).join("").replace(/[. ]+$/g, "") || "media-manifest";
-      if (/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name)) name = `_${name}`;
-      const filename = `${name}.json`;
+      const filename = manifestFilename(manifest.pageUrl, options.filename);
       if (manifest.reviewCollection.refreshing || manifest.reviewCollection.pendingResponses) console.log("리뷰 응답 수집 중입니다. await mediaGrab.collectReviewVideos() 후 다시 내보내면 최신 결과를 포함합니다.");
       const blob = new Blob([JSON.stringify(manifest, null, 2)], { type: "application/json;charset=utf-8" });
       const href = URL.createObjectURL(blob), link = document.createElement("a");
@@ -1208,11 +1214,12 @@
       linkReviewPositions();
       const rows = this.rows;
       if (quiet) return rows;
+      console.log(`수집기 버전: ${this.version} / 목록 파일명: ${this.exportFilename}`);
       console.table(rows);
       console.log(`총 ${found.size}개 URL (페이지 좌표 순서, 위치 미확인 주소는 뒤쪽)\n${rows.map(r => r.url).join("\n")}`);
       console.log(`표시 요소의 선택 주소 ${this.visibleUrls.length}개: copy(mediaGrab.visibleUrls.join('\\n'))`);
-      console.log("일괄 다운로드용 목록 파일 저장: mediaGrab.export()");
-      console.log("설치 없이 브라우저에서 ZIP 다운로드: await mediaGrab.download()");
+      console.log("기본 다운로드: mediaGrab.export() → 저장한 JSON을 download-media.cmd에 드래그 (이미지·GIF·MP4)");
+      console.log("선택: 브라우저에서 ZIP 다운로드: await mediaGrab.download() (CORS·CSP 등으로 실패할 수 있음)");
       console.log("설치 없이 HLS 리뷰 영상을 MP4 ZIP으로 저장: await mediaGrab.downloadHls()");
       if (excluded.size) console.log(`미디어에서 제외한 통계·이벤트 주소 ${excluded.size}개: mediaGrab.excludedRows`);
       if (blockedFrames.size) console.log("접근할 수 없는 iframe:", this.blockedFrames);

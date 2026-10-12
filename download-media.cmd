@@ -2,8 +2,8 @@
 setlocal DisableDelayedExpansion
 chcp 65001 >nul
 if "%~1"=="" (
-  echo Drag media-manifest.json onto this file to start.
-  echo Or run: download-media.cmd "C:\path\media-manifest.json"
+  echo Drag the exported JSON ^(for example shop.coupang.com.json^) onto this file to start.
+  echo Or run: download-media.cmd "C:\path\shop.coupang.com.json"
   pause
   exit /b 1
 )
