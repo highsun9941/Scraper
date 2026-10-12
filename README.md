@@ -1,5 +1,7 @@
 # Scraper
 
+Browser-console media collector for product pages: export ordered image, GIF, and video URLs, download ZIPs, and merge HLS to MP4 without installation.
+
 쇼핑 상품 페이지에서 이미지·GIF·동영상 주소를 수집하는 브라우저 콘솔 스크립트입니다.
 페이지의 DOM, CSS 이미지 주소와 현재 남아 있는 Resource Timing 항목을 읽고, 정확히 같은 URL을 중복 제거합니다.
 페이지 내부 SVG 참조와 확인된 통계·이벤트 주소는 미디어 목록에서 제외합니다.
@@ -25,6 +27,23 @@ H.264·AAC TS 방식의 HLS 리뷰 영상은 콘솔에서 `await mediaGrab.downl
 필요한 리뷰 목록을 열고 스크롤해 데이터를 로딩한 뒤 실행하세요. **영상의 재생 버튼을 누를 필요는 없습니다.**
 초기 자동 수집을 기다리려면 `await mediaGrab.ready`를 실행합니다. 발견한 주소는 팝업을 닫아도 보존합니다.
 
+## 사이트 이름으로 목록 파일 내보내기
+
+```js
+mediaGrab.export()
+```
+
+목록 파일의 기본 이름은 현재 페이지의 **호스트 이름 + `.json`**입니다. 앞의 `www.`는 제외하므로
+쿠팡 페이지에서는 `coupang.com.json`, `www.example.com`에서는 `example.com.json`으로 저장합니다.
+페이지 제목이나 상품명 대신 호스트 이름을 사용하며, 호스트 이름이 비어 있거나 파일명으로 사용할 수 없으면 `media-manifest.json`으로 저장합니다.
+브라우저가 같은 이름의 파일을 이미 저장했다면 브라우저 설정에 따라 이름에 번호가 붙을 수 있습니다.
+
+직접 파일명을 지정할 수도 있습니다. `.json` 확장자는 유지합니다.
+
+```js
+mediaGrab.export({ filename: 'my-media.json' })
+```
+
 ## Windows PowerShell로 일괄 다운로드하기 (추가 설치 없음)
 
 브라우저 ZIP에서 `Failed to fetch`가 많이 나왔다면 먼저 이 방식을 사용합니다.
@@ -38,7 +57,7 @@ PowerShell은 브라우저 밖에서 HTTP 요청을 보내므로 JavaScript의 C
    mediaGrab.export()
    ```
 
-3. 저장한 **`download-report.json` 또는 `media-manifest.json`을 `download-media-powershell.cmd` 위로 드래그**합니다.
+3. 저장한 **`download-report.json` 또는 사이트 이름의 목록 파일(예: `coupang.com.json`)을 `download-media-powershell.cmd` 위로 드래그**합니다.
 4. 완료될 때까지 창을 열어 둡니다. 결과는 **입력 파일이 있는 폴더** 아래 `download-output/날짜-시간-식별자/`에 저장합니다. 창 마지막에도 저장 경로를 표시합니다.
 
 Windows PowerShell 5.1과 기본 .NET 기능을 사용합니다. Python, 별도 PowerShell 모듈이나 PowerShell 7을 설치할 필요가 없습니다.
@@ -69,7 +88,7 @@ mediaGrab.export();
 명령으로 실행하려면 압축을 푼 저장소 폴더에서 PowerShell을 열고 아래처럼 입력합니다.
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\download-media.ps1" -Manifest "C:\Users\사용자\Downloads\media-manifest.json"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\download-media.ps1" -Manifest "C:\Users\사용자\Downloads\coupang.com.json"
 ```
 
 보고서의 실패·건너뜀 항목만 재시도하려면 `-OnlyFailed`를 붙입니다.
@@ -199,7 +218,7 @@ await mediaGrab.download({hls:"mp4"})
 
 1. Python 3.10 이상과 FFmpeg를 준비합니다. [FFmpeg 공식 다운로드 페이지](https://ffmpeg.org/download.html)의 Windows 빌드에서 **`ffmpeg.exe`와 `ffprobe.exe`**를 꺼냅니다.
 2. 최신 `download-videos.py`, `download-videos.cmd`와 위 두 실행 파일을 같은 폴더에 둡니다. FFmpeg가 이미 PATH에 있으면 실행 파일을 복사하지 않아도 됩니다.
-3. **기존 `download-report.json`을 `download-videos.cmd` 위로 드래그**합니다. `download-report.csv`와 `media-manifest.json`도 지원합니다. 이미 원본 URL을 수집했다면 리뷰를 다시 재생하거나 목록을 다시 내보낼 필요가 없습니다.
+3. **기존 `download-report.json`을 `download-videos.cmd` 위로 드래그**합니다. `download-report.csv`와 사이트 이름의 목록 파일(예: `coupang.com.json`)도 지원합니다. 이전에 저장한 `media-manifest.json`도 그대로 사용할 수 있습니다. 이미 원본 URL을 수집했다면 리뷰를 다시 재생하거나 목록을 다시 내보낼 필요가 없습니다.
 
 명령 프롬프트에서 실행하려면 다음 명령을 사용합니다.
 
@@ -333,13 +352,13 @@ mediaGrab.download();
 1. **Python 3.10 이상**을 설치합니다. [공식 Windows 다운로드](https://www.python.org/downloads/windows/)에서 설치할 수 있으며, 별도 Python 패키지는 필요하지 않습니다.
 2. 이 저장소의 최신 ZIP을 받아 압축을 풉니다. `download-media.cmd`와 `download-media.py`를 같은 폴더에 둡니다.
 3. 위의 실행 순서대로 상품 상세를 펼치고, 최신 `collect-page-media.js`를 상품 페이지의 Console에서 실행합니다.
-4. Console에서 아래 명령을 실행해 `media-manifest.json`을 저장합니다.
+4. Console에서 아래 명령을 실행해 사이트 이름의 목록 파일(예: `coupang.com.json`)을 저장합니다.
 
    ```js
    mediaGrab.export()
    ```
 
-5. 저장한 **`media-manifest.json`을 `download-media.cmd` 위로 드래그**합니다. 압축 파일 안에서 실행하지 말고, 압축을 푼 폴더에서 실행하세요.
+5. 저장한 **목록 파일을 `download-media.cmd` 위로 드래그**합니다. 압축 파일 안에서 실행하지 말고, 압축을 푼 폴더에서 실행하세요.
 6. 완료될 때까지 창을 열어 둡니다. 결과는 **목록 파일이 있는 폴더** 아래 `download-output/날짜-시간-식별자/`에 저장합니다. 예를 들어 목록을 다운로드 폴더에 저장했다면 그 폴더 아래에 결과가 생깁니다.
 
 파일명은 `0001.jpg`, `0002.gif`, `0003.mp4`처럼 목록의 순번을 따릅니다. 여러 파일을 동시에 받아도 파일명의 순번은 바뀌지 않습니다.
@@ -364,7 +383,7 @@ copy(JSON.stringify(mediaGrab.getManifest(), null, 2))
 명령줄에서 실행할 수도 있습니다. 터미널을 저장소 폴더에서 열고 목록 파일의 경로를 전달합니다.
 
 ```bat
-py -3 download-media.py "C:\Users\사용자\Downloads\media-manifest.json"
+py -3 download-media.py "C:\Users\사용자\Downloads\coupang.com.json"
 ```
 
 `py` 대신 Python 실행 파일을 직접 쓰려면 `python download-media.py "목록 파일 경로"`로 실행합니다.
@@ -611,3 +630,9 @@ HTTP 오류나 직접 접근 제한은 URL 수집·정렬 코드를 바꾸는 �
 무신사 상세내용에는 GIF·영상이 없었으므로 그 페이지로 GIF·영상 추출을 검증했다고 해석하면 안 됩니다.
 
 검증 기록은 특정 페이지의 당시 상태에 대한 결과이며, 모든 사이트의 모든 미디어 수집을 보장하는 결과는 아닙니다.
+
+## 라이선스
+
+이 프로젝트의 자체 코드와 문서는 [MIT License](LICENSE)로 제공합니다.
+`collect-page-media.js`에 포함된 mux.js는 기존 **Apache License 2.0**을 따릅니다.
+해당 라이선스 전문과 저작권·출처 정보는 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)에 보존합니다.

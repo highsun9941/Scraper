@@ -961,7 +961,8 @@ test('export requests one JSON file and releases its temporary URL', async () =>
   f.doc.body.appendChild = element => { assert.equal(element, link); };
   const info = f.run().export();
   assert.equal(info.count, 1);
-  assert.equal(link.download, 'media-manifest.json');
+  assert.equal(link.download, 'shop.example.json');
+  assert.equal(info.filename, link.download);
   assert.equal(clicked, 1);
   assert.equal(removed, 1);
   const content = JSON.parse(await exportedBlob.text());
@@ -970,6 +971,43 @@ test('export requests one JSON file and releases its temporary URL', async () =>
   assert.equal(timers[0].delay, 60000);
   timers[0].callback();
   assert.equal(revoked, 'blob:test-export');
+});
+
+test('export names manifests after the page hostname and safely handles custom filenames', () => {
+  const cases = [
+    { page: 'https://www.coupang.com/vp/products/123?token=secret', expected: 'coupang.com.json' },
+    { page: 'https://shop.example.co.kr:8443/product#details', expected: 'shop.example.co.kr.json' },
+    { page: 'https://store.json/product', expected: 'store.json.json' },
+    { page: 'https://www.example.com/product', options: { visibleOnly: true }, expected: 'example.com.json' },
+    { page: 'file:///tmp/product.html', expected: 'media-manifest.json' },
+    { page: 'not a URL', expected: 'media-manifest.json' },
+    { page: 'https://www.example.com', options: { filename: '쿠팡 리뷰' }, expected: '쿠팡 리뷰.json' },
+    { page: 'https://www.example.com', options: { filename: 'custom.JSON' }, expected: 'custom.json' },
+    { page: 'https://www.example.com', options: { filename: '  ' }, expected: 'example.com.json' },
+    { page: 'https://www.example.com', options: { filename: '../bad\\name:*?\u0000.json' }, expected: '_bad_name____.json' },
+    { page: 'https://www.example.com', options: { filename: 'CON' }, expected: '_CON.json' },
+    { page: 'https://www.example.com', options: { filename: '...json' }, expected: 'media-manifest.json' },
+    { page: `https://${'a'.repeat(63)}.example.com`, expected: `${'a'.repeat(60)}.json` }
+  ];
+  for (const { page, options = {}, expected } of cases) {
+    const f = fixture({ documentURL: page, baseURI: 'https://cdn.example/assets/' });
+    f.doc.title = 'Unrelated product title';
+    f.doc.body.append(f.img('/one.jpg', 10));
+    const link = { style: {}, click() {}, remove() {} };
+    f.context.Blob = Blob;
+    f.context.URL = class extends URL {
+      static createObjectURL() { return 'blob:test-export'; }
+      static revokeObjectURL() {}
+    };
+    f.context.setTimeout = () => {};
+    f.doc.createElement = () => link;
+    f.doc.body.appendChild = () => {};
+    const info = f.run().export(options);
+    assert.equal(link.download, expected, page);
+    assert.equal(info.filename, expected, page);
+    assert.equal(info.visibleOnly, Boolean(options.visibleOnly));
+    assert.equal(info.count, 1);
+  }
 });
 
 const gifBytes = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
