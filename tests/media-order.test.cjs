@@ -712,6 +712,105 @@ test('rescan captures late player sources and preserves them after the review po
   assert.equal(row.top, null);
 });
 
+test('automatic capture preserves both Amazon video-card lists after they close without scanning or playback', () => {
+  const f = watchFixture({ documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  f.doc.defaultView.fetch = () => assert.fail('card metadata must not make requests');
+  const grab = f.run();
+  const expected = new Map();
+  for (const [sectionId, playlist, offset] of [
+    ['ivVideoBlock', 'product-videos', 0], ['vftphero-vse-related-videos', 'related-videos', 10]
+  ]) {
+    const section = f.element('div', { attrs: { id: sectionId } });
+    for (let i = 0; i < 10; i++) {
+      const id = offset + i;
+      const href = `https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-us-east-1-prod/video-${id}/default.jobtemplate.hls.m3u8?signature=whole%2Fvalue&expires=999`;
+      const title = `Amazon video ${id}`;
+      const card = f.element('div', { attrs: { 'data-element-id': 'video-carousel-item',
+        'data-video-url': href, 'data-title': title, 'data-aci-content-id': `amzn1.vse.video.id-${id}` },
+        rect: { top: 100 + i * 90, left: 200 } });
+      card.closest = selector => selector.includes('#' + sectionId) ? section : null;
+      section.append(card);
+      expected.set(href, { title, playlist, videoId: `amzn1.vse.video.id-${id}` });
+    }
+    f.doc.body.append(section);
+    f.mutations[0].callback([{ type: 'childList', target: f.doc.body, addedNodes: [section], removedNodes: [] }]);
+    assert.equal(grab.videos.length, offset + 10);
+    f.doc.body.children = f.doc.body.children.filter(el => el !== section);
+    section.isConnected = false;
+    for (const card of section.children) card.isConnected = false;
+    f.mutations[0].callback([{ type: 'childList', target: f.doc.body, addedNodes: [], removedNodes: [section] }]);
+  }
+  assert.equal(grab.videos.length, 20);
+  const manifest = grab.getManifest();
+  assert.equal(manifest.items.length, 20);
+  for (const row of manifest.items) {
+    const item = expected.get(row.url);
+    assert.ok(item, row.url);
+    assert.equal(row.type, 'STREAM');
+    assert.equal(row.provider, 'amazon');
+    assert.equal(row.videoTitle, item.title);
+    assert.equal(row.videoId, item.videoId);
+    assert.deepEqual(Array.from(row.playlists), [item.playlist]);
+    assert.equal(row.top, null);
+  }
+  grab.stopWatching();
+});
+
+test('Amazon video cards refresh their URL and identity on attribute changes and retain playlist provenance', () => {
+  const f = watchFixture({ documentURL: 'https://www.amazon.com/dp/TEST' });
+  const first = 'https://m.media-amazon.com/first.m3u8?token=original';
+  const second = 'https://m.media-amazon.com/second.mp4?token=next';
+  const section = f.element('div', { attrs: { id: 'ivVideoBlock' } });
+  const card = f.element('div', { attrs: { 'data-element-id': 'video-carousel-item',
+    'data-video-url': first, 'data-title': 'First video', 'data-aci-content-id': 'amzn1.vse.video.first' } });
+  card.closest = selector => selector.split(',').some(part => part.trim() === '#' + section.attrs.id) ? section : null;
+  section.append(card); f.doc.body.append(section);
+  const grab = f.run();
+  card.attrs['data-video-url'] = second;
+  card.attrs['data-title'] = 'Second video';
+  card.attrs['data-aci-content-id'] = 'amzn1.vse.video.second';
+  f.mutations[0].callback([{ type: 'attributes', target: card, attributeName: 'data-video-url' }]);
+  assert.deepEqual(new Set(grab.urls), new Set([first, second]));
+  const changed = grab.rows.find(row => row.url === second);
+  assert.equal(changed.type, 'VIDEO');
+  assert.equal(changed.videoTitle, 'Second video');
+  assert.equal(changed.videoId, 'amzn1.vse.video.second');
+  section.attrs.id = 'vftphero-vse-related-videos';
+  for (const callback of f.intervals.values()) callback();
+  assert.deepEqual(new Set(grab.rows.find(row => row.url === second).playlists),
+    new Set(['product-videos', 'related-videos']));
+  grab.stopWatching();
+});
+
+test('Amazon image metadata preserves actual original URLs and changing GIFs without rescanning', () => {
+  const f = watchFixture({ documentURL: 'https://www.amazon.com/dp/TEST' });
+  const original = 'https://m.media-amazon.com/images/I/original.jpg?signature=whole%2Fvalue&expires=999';
+  const large = 'https://m.media-amazon.com/images/I/large.jpg';
+  const animation = 'https://m.media-amazon.com/images/I/animation.gif';
+  const image = f.img('/small.jpg', 200, 20, { attrs: { 'data-old-hires': original,
+    'data-a-dynamic-image': JSON.stringify({ [large]: [1500, 1500], 'javascript:alert(1)': [1, 1] }) } });
+  f.doc.body.append(image);
+  const grab = f.run();
+  assert.deepEqual(new Set(grab.urls), new Set([url('/small.jpg'), original, large]));
+  image.currentSrc = animation;
+  image.attrs.src = animation;
+  f.mutations[0].callback([{ type: 'attributes', target: image, attributeName: 'src' }]);
+  assert.equal(grab.rows.find(row => row.url === animation).type, 'GIF');
+  const late = 'https://m.media-amazon.com/images/I/later-original.jpg';
+  image.attrs['data-a-dynamic-image'] = JSON.stringify({ [late]: [2000, 2000] });
+  f.mutations[0].callback([{ type: 'attributes', target: image, attributeName: 'data-a-dynamic-image' }]);
+  assert.ok(grab.urls.includes(late));
+  image.attrs['data-a-dynamic-image'] = '{malformed';
+  image.attrs['data-old-hires'] = original;
+  f.mutations[0].callback([{ type: 'attributes', target: image, attributeName: 'data-a-dynamic-image' }]);
+  f.doc.body.children = [];
+  image.isConnected = false;
+  f.mutations[0].callback([{ type: 'childList', target: f.doc.body, addedNodes: [], removedNodes: [image] }]);
+  const urls = new Set(grab.getManifest().items.map(row => row.url));
+  for (const href of [original, large, animation, late]) assert.ok(urls.has(href), href);
+  grab.stopWatching();
+});
+
 test('Video.js sources use iframe page coordinates and exclude audio players', () => {
   const f = fixture(), child = fixture();
   const video = child.element('video', { rect: { top: 20, left: 30 } });
@@ -927,7 +1026,7 @@ test('JSON manifest preserves full ordered addresses and omits excluded events',
   f.doc.body.append(f.img(long, 500), f.img('/first.jpg', 10));
   const manifest = f.run().getManifest();
   assert.equal(manifest.schema, 'media-grab/1');
-  assert.equal(manifest.collectorVersion, '2026.10.12.1');
+  assert.equal(manifest.collectorVersion, '2026.10.13.1');
   assert.equal(manifest.pageUrl, base);
   assert.equal(manifest.title, '상품 테스트');
   assert.ok(Number.isFinite(Date.parse(manifest.exportedAt)));

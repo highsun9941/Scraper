@@ -39,7 +39,7 @@ H.264·AAC TS 방식의 HLS 리뷰 영상은 콘솔에서 `await mediaGrab.downl
 
 최신 파일을 내려받아도 이미 페이지에서 실행 중인 `mediaGrab`이나 저장해 둔 이전 스니펫은 자동으로 바뀌지 않습니다.
 **최신 `collect-page-media.js` 전체를 다시 붙여 넣어 실행**하고, 스니펫을 사용한다면 저장된 코드도 전체 교체합니다.
-현재 버전은 Console에서 `mediaGrab.version`으로 확인할 수 있으며, 이 버전의 값은 **`2026.10.12.1`**입니다.
+현재 버전은 Console에서 `mediaGrab.version`으로 확인할 수 있으며, 이 버전의 값은 **`2026.10.13.1`**입니다.
 
 ## 사이트 이름으로 목록 파일 내보내기
 
@@ -59,6 +59,32 @@ mediaGrab.export()
 ```js
 mediaGrab.export({ filename: 'my-media.json' })
 ```
+
+## Amazon 상품 페이지의 이미지·영상 목록 수집하기
+
+1. 최신 `collect-page-media.js` 전체를 상품 페이지 콘솔에서 실행하고 `mediaGrab.version`이 `2026.10.13.1`인지 확인합니다.
+2. 상품의 메인 이미지·상세내용·갤러리와 관련 영상 목록을 **직접 열고 스크롤해 로딩**합니다. 수집기가 자동으로 클릭하거나 목록의 다음 페이지를 열지는 않습니다.
+3. 영상 카드에 `data-video-url`·`data-video-src` 등으로 원본 주소가 제공되면 **재생하지 않아도** 수집합니다. 실행 후 자동 감시가 발견한 주소는 팝업을 닫아도 보존합니다.
+4. 필요한 목록을 모두 열어 본 뒤 전체 후보를 JSON으로 내보내고, 저장한 파일을 `download-media.cmd`에 드래그합니다.
+
+   ```js
+   mediaGrab.scan()
+   console.table(mediaGrab.videos)
+   mediaGrab.export()
+   ```
+
+`www.amazon.com` 페이지의 기본 파일명은 `amazon.com.json`입니다.
+Amazon.com과 그 하위 도메인의 영상 카드에서 제공된 제목·ID는 `videoTitle`·`videoId`로, 출처는 `provider: "amazon"`으로 기록합니다.
+목록 출처가 확인되면 `playlists`에 `product-videos`·`related-videos`를 보존하며, 같은 URL이 여러 목록에 있으면 출처 정보를 합칩니다.
+이미지의 `data-a-dynamic-image` 사전에 있는 주소와 `data-old-hires`도 읽습니다. 이미지 크기 표기나 파일명에서 원본 URL을 추측하지 않습니다.
+
+**URL 수는 실제 영상 개수와 다를 수 있습니다.** MP4·HLS·DASH 주소, 같은 영상의 화질별 후보와 임시 `blob:` 주소가 함께 기록될 수 있습니다.
+`mediaGrab.videos`는 임시 `blob:` 주소를 제외한 목록입니다. 전체 후보를 내보내려면 기본 `mediaGrab.export()`를 사용합니다.
+`visibleOnly: true`는 닫힌 팝업·숨긴 카드·선택되지 않은 이미지 후보 등을 제외할 수 있습니다.
+
+직접 MP4 주소는 기본 CMD로 파일을 저장하지만, HLS·DASH는 **재생목록만 저장**합니다.
+해당 영상의 MP4 병합은 아래의 `download-videos.cmd` + FFmpeg·FFprobe 방식을 사용합니다.
+아직 로딩되지 않아 페이지에 URL이 없는 영상은 수집할 수 없으며, 실제 Amazon 페이지의 전체 영상 목록과 대조한 검증은 완료하지 않았습니다.
 
 ## 선택: Windows PowerShell로 일괄 다운로드하기 (추가 설치 없음)
 
@@ -490,6 +516,7 @@ copy(mediaGrab.rows.filter(x => ['VIDEO', 'STREAM'].includes(x.type)).map(x => x
 ## 수집 대상
 
 - `img`의 `currentSrc`, `src`, `srcset`과 여러 지연 로딩 속성
+- Amazon 이미지의 `data-a-dynamic-image` 주소 사전과 `data-old-hires`, 로딩된 영상 카드의 `data-video-url`·`data-video-src`
 - `picture > source`, SVG의 외부 `image` 주소, 이미지형 `input`, 이미지·영상형 `object`/`embed`
 - CSS 배경·마스크·테두리·목록 이미지와 `::before`/`::after`의 이미지 주소
 - `video`/`source`의 영상 주소와 `video.poster`, 접근 가능한 Video.js 재생기의 원본 소스
@@ -518,7 +545,10 @@ CSS의 `url(#id)`와 현재 문서 URL에 `#id`가 붙은 주소는 페이지 �
 | `visible` | 표시되는 요소의 선택 주소 또는 계산된 CSS 이미지 주소인지 여부 |
 | `source` | 주소를 발견한 요소 속성이나 CSS, 네트워크 등의 경로 |
 | `temporary` | `true`이면 페이지 세션에 의존하는 `blob:` 임시 주소 |
-| `provider`, `videoId`, `embedUrl` | 외부 영상의 제공자·영상 ID·발견한 임베드 주소. `EMBED`에만 포함 |
+| `provider`, `videoId` | 제공자·영상 ID가 확인된 경우 기록. YouTube 임베드와 Amazon 영상 카드에 사용 |
+| `embedUrl` | 외부 영상의 발견한 임베드 주소. `EMBED`에 포함 |
+| `videoTitle` | 영상 카드에서 확인한 제목 |
+| `playlists` | 영상 카드가 속한 목록의 확인된 출처. 같은 URL의 여러 출처를 보존 |
 
 내보낸 JSON의 `pendingVideos`는 썸네일만 확인된 리뷰이며, `blockedFrames`는 내부 문서 접근이 제한된 iframe입니다.
 

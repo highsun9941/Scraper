@@ -92,7 +92,11 @@
       } else if (row.type === "IMAGE" && type !== "IMAGE") {
         Object.assign(row, { type, source });
       }
-      if (metadata) Object.assign(row, metadata);
+      if (metadata) {
+        const { playlists, ...fields } = metadata;
+        Object.assign(row, fields);
+        if (playlists?.length) row.playlists = [...new Set([...(row.playlists || []), ...playlists])];
+      }
       visible = Boolean(position && visible);
       // 같은 URL은 실제 표시되는 첫 위치를 우선합니다. 숨긴 복제본은 뒤로 둡니다.
       if (position && ((!row.visible && visible) ||
@@ -496,17 +500,102 @@
         absolute(source.src, mediaBase) === selected, element);
     }
   };
-  // 동적 팝업은 닫히기 전에 읽습니다. 재생을 시작하거나 src를 변경하지 않습니다.
+  const imageDictionaries = new WeakMap();
+  const imageOwner = el => el.localName === "source" && el.parentElement?.localName === "picture" ?
+    el.parentElement.querySelector("img") : el;
+  const isImageElement = el => ["img", "image"].includes(el.localName) ||
+    el.localName === "input" && el.type === "image" ||
+    el.localName === "source" && el.parentElement?.localName === "picture";
+  const captureImage = (el, base, position, element) => {
+    const tag = el.localName, owner = imageOwner(el);
+    const primary = absolute(owner?.currentSrc || owner?.getAttribute("src") ||
+      owner?.getAttribute("href") || owner?.getAttribute("xlink:href"), base);
+    const kind = /^image\/gif$/i.test(el.getAttribute("type") || "") ? "GIF" : "IMAGE";
+    const emit = (raw, source) => add(raw, kind, base, source, position,
+      absolute(raw, base) === primary, element);
+    emit(el.currentSrc, `${tag}.currentSrc`);
+    for (const attr of ["src", "data-src", "data-original", "data-lazy-src", "data-original-src", "data-url", "data-large", "data-old-hires"]) {
+      emit(el.getAttribute(attr), `${tag}.${attr}`);
+    }
+    for (const attr of ["srcset", "data-srcset", "data-lazy-srcset"]) {
+      srcset(el.getAttribute(attr) || "", kind, base, `${tag}.${attr}`, position, primary, element);
+    }
+    if (tag === "image") emit(el.getAttribute("href") || el.getAttribute("xlink:href"), "svg.image");
+    const attribute = el.getAttribute("data-a-dynamic-image") || "";
+    const text = attribute.length <= 32768 ? attribute : "";
+    let dictionary = imageDictionaries.get(el);
+    if (!dictionary || dictionary.text !== text) {
+      const urls = [];
+      if (text) {
+        try {
+          const data = JSON.parse(text);
+          if (data && typeof data === "object" && !Array.isArray(data)) {
+            for (const raw of Object.keys(data).slice(0, 256)) {
+              if (/^(?:https?:|blob:|data:|\/|\.{1,2}\/)/i.test(raw) || guess(raw)) urls.push(raw);
+            }
+          }
+        } catch {}
+      }
+      dictionary = { text, urls };
+      imageDictionaries.set(el, dictionary);
+    }
+    // Amazon가 실제로 제공한 주소만 읽습니다. 파일명·해상도에서 CDN 경로를 만들지 않습니다.
+    for (const raw of dictionary.urls) emit(raw, `${tag}.data-a-dynamic-image`);
+  };
+  const amazonVideoMetadata = el => {
+    try {
+      const doc = el.ownerDocument, win = doc.defaultView;
+      const page = new URL(doc.URL || doc.location?.href || win.location?.href || doc.baseURI);
+      if (!/(?:^|\.)amazon\.com$/i.test(page.hostname)) return null;
+      let card = null;
+      for (let node = el; node; node = parentOf(node)) {
+        if (node.getAttribute?.("data-element-id") === "video-carousel-item" ||
+            String(node.getAttribute?.("class") || "").split(/\s+/).includes("vse-video-card")) { card = node; break; }
+      }
+      if (!card) return null;
+      const id = [el.getAttribute("data-aci-content-id"), el.getAttribute("data-asin"),
+        card.getAttribute("data-aci-content-id"), card.getAttribute("data-csa-c-item-id")]
+        .find(value => value?.startsWith("amzn1.") && value.length <= 256);
+      const title = String(el.getAttribute("data-title") || card.getAttribute("data-title") || "").trim().slice(0, 1000);
+      const playlists = [];
+      for (let node = card; node; node = parentOf(node)) {
+        const id = node.getAttribute?.("id");
+        if (["ivVideoBlock", "ivVideosTab"].includes(id)) playlists.push("product-videos");
+        if (id === "vftphero-vse-related-videos") playlists.push("related-videos");
+      }
+      return { provider: "amazon", ...(id ? { videoId: id } : {}),
+        ...(title ? { videoTitle: title } : {}), ...(playlists.length ? { playlists } : {}) };
+    } catch { return null; }
+  };
+  const captureVideoAttributes = (el, position, element) => {
+    const base = el.baseURI || el.ownerDocument?.baseURI;
+    const metadata = amazonVideoMetadata(el);
+    const primary = absolute(el.currentSrc || el.getAttribute("src"), base);
+    for (const attr of ["data-video-src", "data-video-url"]) {
+      const raw = el.getAttribute(attr);
+      if (!raw) continue;
+      if (/url\(/i.test(raw)) css(raw, base, attr, position, false, element);
+      else if (/^(?:https?:|blob:|data:|\/|\.{1,2}\/)/i.test(raw) || guess(raw)) {
+        add(raw, "VIDEO", base, attr, position, Boolean(metadata) ||
+          el.localName === "video" && absolute(raw, base) === primary, element, metadata);
+      }
+    }
+  };
+  // 동적 이미지·영상 카드와 팝업은 제거되기 전에 읽습니다. 재생하거나 src를 변경하지 않습니다.
   const captureMedia = (el, ctx, element = Infinity) => {
     if (!el?.localName) return;
     const tag = el.localName, base = el.baseURI || el.ownerDocument?.baseURI;
     const win = el.ownerDocument?.defaultView;
     if (!win) return;
+    const image = isImageElement(el), videoAttributes = ["data-video-src", "data-video-url"].some(a => el.getAttribute(a));
     const previewSources = tag === "img" ? [el.currentSrc, ...["src", "data-src", "data-original"].map(a => el.getAttribute(a))] : [];
     if (!["video", "video-js", "iframe", "object", "embed"].includes(tag) &&
         !String(el.getAttribute("class") || "").split(/\s+/).includes("video-js") &&
-        !previewSources.some(raw => reviewKey(raw, base))) return;
-    const position = el.isConnected === false ? null : locate(el, ctx);
+        !image && !videoAttributes) return;
+    const owner = image ? imageOwner(el) : el;
+    const position = !owner || owner.isConnected === false ? null : locate(owner, ctx);
+    if (image) captureImage(el, base, position, element);
+    if (videoAttributes) captureVideoAttributes(el, position, element);
     if (["iframe", "object", "embed"].includes(tag)) {
       const primary = absolute(el.src || el.getAttribute("src") || el.getAttribute("data"), base);
       for (const attr of ["src", "data", "data-src", "data-lazy-src", "data-original-src"]) {
@@ -530,7 +619,7 @@
     if (tag === "video") {
       const primary = absolute(el.currentSrc || el.getAttribute("src"), base);
       add(el.currentSrc, "VIDEO", base, "video.currentSrc", position, true, element);
-      for (const attr of ["src", "data-src", "data-video-src", "data-video-url"]) {
+      for (const attr of ["src", "data-src"]) {
         const raw = el.getAttribute(attr);
         add(raw, "VIDEO", base, `video.${attr}`, position, absolute(raw, base) === primary, element);
       }
@@ -554,10 +643,18 @@
     captureMedia(root, ctx);
     const doc = root?.ownerDocument || root;
     captureReviewScript(root, doc?.baseURI, doc?.defaultView);
-    for (const el of root?.querySelectorAll?.("video, video-js, .video-js, iframe, object, embed, img, script") || []) {
+    // 모든 요소를 가볍게 순회해 새로 생긴 open shadow root도 찾습니다.
+    // captureMedia는 관계없는 요소의 위치·CSS를 계산하기 전에 반환합니다.
+    const captureShadow = el => {
+      if (!el?.shadowRoot) return;
+      observeRoot(el.shadowRoot, ctx);
+      captureTree(el.shadowRoot, ctx, true);
+    };
+    captureShadow(root);
+    for (const el of root?.querySelectorAll?.("*") || []) {
       captureMedia(el, ctx);
       captureReviewScript(el, el.baseURI || doc?.baseURI, doc?.defaultView);
-      if (el.shadowRoot) captureTree(el.shadowRoot, ctx, true);
+      captureShadow(el);
     }
     linkReviewPositions();
   };
@@ -581,16 +678,19 @@
         const observer = new win.MutationObserver(records => {
           if (!watching) return;
           const context = watchedRoots.get(root) || ctx;
+          const changed = new Set();
           for (const record of records) {
-            captureTree(record.target, context);
+            changed.add(record.target);
             for (const node of [...(record.addedNodes || []), ...(record.removedNodes || [])]) {
-              captureTree(node, context);
-              if (node.shadowRoot) observeRoot(node.shadowRoot, context);
+              changed.add(node);
             }
           }
+          for (const node of changed) captureTree(node, context);
         });
         observer.observe(root, { childList: true, subtree: true, attributes: true,
-          attributeFilter: ["src", "data", "data-src", "data-lazy-src", "data-original-src", "poster", "data-video-src", "data-video-url"] });
+          attributeFilter: ["src", "srcset", "data", "data-src", "data-original", "data-lazy-src", "data-original-src",
+            "data-url", "data-large", "data-srcset", "data-lazy-srcset", "data-old-hires", "data-a-dynamic-image",
+            "href", "xlink:href", "poster", "data-video-src", "data-video-url", "data-title", "data-aci-content-id", "data-asin"] });
         cleanups.add(() => observer.disconnect());
       }
     } catch {}
@@ -644,7 +744,7 @@
         kind = /^image\/gif$/i.test(mime) ? "GIF" : /^image\//i.test(mime) ? "IMAGE" : /^video\//i.test(mime) ? "VIDEO" : kind;
         emit(el.getAttribute("data") || el.getAttribute("src"), kind, tag);
       }
-      if (kind) {
+      if (kind && !isImageElement(el)) {
         emit(el.currentSrc, kind, `${tag}.currentSrc`);
         for (const a of ["src", "data-src", "data-original", "data-lazy-src", "data-original-src", "data-url", "data-large"]) {
           emit(el.getAttribute(a), kind, `${tag}.${a}`);
@@ -653,17 +753,16 @@
           srcset(el.getAttribute(a) || "", kind, base, `${tag}.${a}`, position, primary, element);
         }
       }
-      if (tag === "image") emit(el.getAttribute("href") || el.getAttribute("xlink:href"), "IMAGE", "svg.image");
       if (tag === "video") emit(el.getAttribute("poster"), "IMAGE", "video.poster", true);
       captureMedia(el, ctx, element);
       captureReviewScript(el, base, win);
       if (["a", "link"].includes(tag)) add(el.getAttribute("href"), "", base, `${tag}.href`);
-      for (const a of ["data-bg", "data-background", "data-background-image", "data-image", "data-image-src", "data-video-src", "data-video-url", "data-poster"]) {
+      for (const a of ["data-bg", "data-background", "data-background-image", "data-image", "data-image-src", "data-poster"]) {
         const value = el.getAttribute(a);
         if (!value) continue;
         if (/url\(/i.test(value)) css(value, base, a, position, false, element, documentURL);
         else if (/^(?:https?:|blob:|data:|\/|\.{1,2}\/)/i.test(value) || guess(value)) {
-          emit(value, a.includes("video") ? "VIDEO" : "IMAGE", a, false);
+          emit(value, "IMAGE", a, false);
         }
       }
       for (const pseudo of [null, "::before", "::after"]) {
@@ -716,7 +815,10 @@
   }).map((r, i) => ({
     order: i + 1, type: r.type, url: r.url, source: r.source, temporary: r.temporary,
     top: r.position?.top ?? null, left: r.position?.left ?? null, visible: r.visible,
-    ...(r.provider ? { provider: r.provider, videoId: r.videoId, embedUrl: r.embedUrl } : {})
+    ...(r.provider ? { provider: r.provider, ...(r.videoId ? { videoId: r.videoId } : {}),
+      ...(r.embedUrl ? { embedUrl: r.embedUrl } : {}) } : {}),
+    ...(r.videoTitle ? { videoTitle: r.videoTitle } : {}),
+    ...(r.playlists?.length ? { playlists: [...r.playlists] } : {})
   }));
   // 외부 라이브러리 없이 ZIP STORE를 만듭니다. 원본 미디어를 재인코딩하지 않습니다.
   const crcTable = Uint32Array.from({ length: 256 }, (_, n) => {
@@ -1003,7 +1105,7 @@
   };
   let downloadController = null, downloadReport = null;
   window.mediaGrab = {
-    version: "2026.10.12.1",
+    version: "2026.10.13.1",
     get exportFilename() { return manifestFilename(document.URL || document.location?.href || document.baseURI); },
     get rows() { return ordered(); },
     get urls() { return this.rows.map(r => r.url); },
@@ -1035,7 +1137,7 @@
       await waitReviewTasks();
       linkReviewPositions();
       const result = { videos: this.videos, pendingVideos: this.pendingVideos, ...this.reviewCollection };
-      console.log(`재생 없이 리뷰 데이터 확인: 영상·임베드 ${result.videos.length}개 / 원본 미확인 리뷰 ${result.pendingVideos.length}개 / 응답 대기 ${result.pendingResponses}개`);
+      console.log(`재생 없이 리뷰 데이터 확인: 영상·재생목록·임베드 주소 ${result.videos.length}개 / 원본 미확인 리뷰 ${result.pendingVideos.length}개 / 응답 대기 ${result.pendingResponses}개`);
       return result;
     },
     get watching() { return watching; },
@@ -1056,7 +1158,7 @@
         linkReviewPositions();
         return { videos: this.videos, pendingVideos: this.pendingVideos, ...this.reviewCollection };
       })();
-      console.log("리뷰 데이터·영상 감시 시작. 자동 수집 완료 대기: await mediaGrab.ready. 종료: mediaGrab.stopWatching()");
+      console.log("이미지·영상 카드·리뷰 데이터 감시 시작. 초기 수집 완료 대기: await mediaGrab.ready. 종료: mediaGrab.stopWatching()");
       return { watching, intervalMs };
     },
     stopWatching() {
@@ -1223,7 +1325,7 @@
       console.log("설치 없이 HLS 리뷰 영상을 MP4 ZIP으로 저장: await mediaGrab.downloadHls()");
       if (excluded.size) console.log(`미디어에서 제외한 통계·이벤트 주소 ${excluded.size}개: mediaGrab.excludedRows`);
       if (blockedFrames.size) console.log("접근할 수 없는 iframe:", this.blockedFrames);
-      console.log(`외부 영상 ${this.embeds.length}개 / 원본 영상·재생목록 ${this.videos.length - this.embeds.length}개 / 미확인 리뷰 영상 ${this.pendingVideos.length}개`);
+      console.log(`외부 영상 링크 ${this.embeds.length}개 / 영상·재생목록 주소 ${this.videos.length - this.embeds.length}개 (MP4·HLS·DASH 등, 같은 영상의 여러 주소 포함 가능) / 미확인 리뷰 영상 ${this.pendingVideos.length}개`);
       if (this.pendingVideos.length) console.log("미확인 리뷰 영상: mediaGrab.pendingVideos. await mediaGrab.collectReviewVideos()로 리뷰 데이터를 확인하세요.");
       return rows;
     }
