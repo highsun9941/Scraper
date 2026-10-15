@@ -1035,6 +1035,180 @@
     if (!segments.length) throw new Error("HLS 재생목록에 영상 조각이 없습니다.");
     return { segments };
   };
+  const hlsSameBytes = (a, b) => a.length === b.length && a.every((byte, i) => byte === b[i]);
+  // 색상 VUI만 제거한 비교용 SPS를 만듭니다. 원본 SPS·영상 바이트는 고치지 않습니다.
+  const hlsSpsWithoutColor = nal => {
+    if (nal.length < 5 || nal.length > 4096 || (nal[0] & 31) !== 7) throw new Error("H.264 SPS 색상 정보를 확인하지 못했습니다.");
+    const rbsp = [];
+    let zeros = 0;
+    for (const byte of nal.subarray(1)) {
+      if (zeros === 2 && byte === 3) { zeros = 0; continue; }
+      rbsp.push(byte); zeros = byte === 0 ? zeros + 1 : 0;
+    }
+    let bits = rbsp.map(byte => byte.toString(2).padStart(8, "0")).join("");
+    const stop = bits.lastIndexOf("1");
+    if (stop < 0) throw new Error("H.264 SPS가 올바르지 않습니다.");
+    bits = bits.slice(0, stop + 1);
+    let pos = 0;
+    const read = count => {
+      if (pos + count > stop) throw new Error("H.264 SPS가 불완전합니다.");
+      const value = count ? parseInt(bits.slice(pos, pos + count), 2) : 0;
+      pos += count; return value;
+    };
+    const ue = () => {
+      let count = 0;
+      while (read(1) === 0) if (++count > 31) throw new Error("H.264 SPS 값이 너무 큽니다.");
+      return 2 ** count - 1 + read(count);
+    };
+    const se = () => { const value = ue(); return value & 1 ? (value + 1) / 2 : -value / 2; };
+    const profile = read(8); read(16); ue();
+    if ([100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].includes(profile)) {
+      const chroma = ue();
+      if (chroma > 3) throw new Error("지원하지 않는 H.264 색차 형식입니다.");
+      if (chroma === 3) read(1);
+      ue(); ue(); read(1);
+      if (read(1)) for (let list = 0; list < (chroma === 3 ? 12 : 8); list++) if (read(1)) {
+        let last = 8, next = 8;
+        for (let index = 0; index < (list < 6 ? 16 : 64); index++) {
+          if (next !== 0) next = (last + se() + 256) & 255;
+          last = next === 0 ? last : next;
+        }
+      }
+    }
+    ue();
+    const order = ue();
+    if (order === 0) ue();
+    else if (order === 1) {
+      read(1); se(); se();
+      const cycle = ue();
+      if (cycle > 256) throw new Error("H.264 SPS 반복 제한을 넘었습니다.");
+      for (let index = 0; index < cycle; index++) se();
+    } else if (order !== 2) throw new Error("H.264 SPS 순서 정보가 올바르지 않습니다.");
+    ue(); read(1); ue(); ue();
+    if (!read(1)) read(1);
+    read(1);
+    if (read(1)) { ue(); ue(); ue(); ue(); }
+    if (!read(1)) throw new Error("H.264 SPS의 색상 VUI 구간을 확인하지 못했습니다.");
+    if (read(1) && read(8) === 255) read(32);
+    if (read(1)) read(1);
+    const start = pos;
+    if (read(1)) { read(3); read(1); if (read(1)) read(24); }
+    bits = bits.slice(0, start) + "0" + bits.slice(pos);
+    bits = bits.padEnd(Math.ceil(bits.length / 8) * 8, "0");
+    const bytes = [nal[0]];
+    zeros = 0;
+    for (let index = 0; index < bits.length; index += 8) {
+      const byte = parseInt(bits.slice(index, index + 8), 2);
+      if (zeros === 2 && byte <= 3) { bytes.push(3); zeros = 0; }
+      bytes.push(byte); zeros = byte === 0 ? zeros + 1 : 0;
+    }
+    return new Uint8Array(bytes);
+  };
+  const hlsAvcInit = (init, mux) => {
+    const one = (bytes, name) => {
+      const matches = mux.probe.findBox(bytes, [name]);
+      if (matches.length !== 1) throw new Error("MP4의 H.264 초기화 구조를 확인하지 못했습니다.");
+      return matches[0];
+    };
+    const moov = one(init, "moov"), videos = [];
+    for (const trak of mux.probe.findBox(moov, ["trak"])) {
+      const mdia = one(trak, "mdia"), minf = one(mdia, "minf"), stbl = one(minf, "stbl"), stsd = one(stbl, "stsd");
+      const samples = mux.probe.findBox(stsd.subarray(8), ["avc1"]);
+      if (!samples.length) continue;
+      if (samples.length !== 1 || stsd.length < 8 || new DataView(stsd.buffer, stsd.byteOffset, stsd.byteLength).getUint32(4) !== 1) {
+        throw new Error("여러 H.264 샘플 형식이 있는 MP4는 지원하지 않습니다.");
+      }
+      const sample = samples[0], avcc = one(sample.subarray(78), "avcC");
+      if (avcc.length < 7 || avcc[0] !== 1 || (avcc[4] & 3) !== 3) throw new Error("지원하지 않는 H.264 NAL 길이 형식입니다.");
+      const view = new DataView(avcc.buffer, avcc.byteOffset, avcc.byteLength), sps = [], pps = [];
+      let cursor = 6;
+      const parameters = (count, target, type) => {
+        if (!count) throw new Error("H.264 SPS·PPS 정보가 없습니다.");
+        for (let index = 0; index < count; index++) {
+          if (cursor + 2 > avcc.length) throw new Error("H.264 매개변수가 불완전합니다.");
+          const length = view.getUint16(cursor); cursor += 2;
+          if (!length || cursor + length > avcc.length || (avcc[cursor] & 31) !== type) throw new Error("H.264 매개변수가 올바르지 않습니다.");
+          target.push(avcc.subarray(cursor, cursor + length)); cursor += length;
+        }
+      };
+      parameters(avcc[5] & 31, sps, 7);
+      const spsEnd = cursor;
+      if (cursor >= avcc.length) throw new Error("H.264 PPS 정보가 없습니다.");
+      parameters(avcc[cursor++], pps, 8);
+      const parents = [moov, trak, mdia, minf, stbl, stsd, sample];
+      if ([avcc, ...parents].some(bytes => bytes.buffer !== init.buffer)) throw new Error("MP4 초기화 참조를 확인하지 못했습니다.");
+      videos.push({ avcc, sps, pps, spsEnd, parents, typeOffset: sample.byteOffset - init.byteOffset - 4 });
+    }
+    if (videos.length !== 1) throw new Error("단일 H.264 영상 트랙만 지원합니다.");
+    return videos[0];
+  };
+  const hlsInitWithoutColor = (init, config) => {
+    const chunks = [config.avcc.subarray(0, 6)];
+    for (const nal of config.sps) {
+      const normalized = hlsSpsWithoutColor(nal);
+      chunks.push(new Uint8Array([normalized.length >>> 8, normalized.length & 255]), normalized);
+    }
+    chunks.push(config.avcc.subarray(config.spsEnd));
+    const payloadLength = chunks.reduce((total, bytes) => total + bytes.length, 0);
+    const box = new Uint8Array(payloadLength + 8), view = new DataView(box.buffer);
+    view.setUint32(0, box.length); box.set([97, 118, 99, 67], 4);
+    let cursor = 8;
+    for (const bytes of chunks) { box.set(bytes, cursor); cursor += bytes.length; }
+    const start = config.avcc.byteOffset - init.byteOffset - 8, end = start + config.avcc.length + 8;
+    const delta = box.length - (end - start), result = new Uint8Array(init.length + delta);
+    result.set(init.subarray(0, start)); result.set(box, start); result.set(init.subarray(end), start + box.length);
+    const original = new DataView(init.buffer, init.byteOffset, init.byteLength), output = new DataView(result.buffer);
+    for (const parent of config.parents) {
+      const offset = parent.byteOffset - init.byteOffset - 8;
+      output.setUint32(offset, original.getUint32(offset) + delta);
+    }
+    return result;
+  };
+  // avc3로 표시하기 전에, 변경된 SPS·PPS가 실제 영상의 IDR 프레임 앞에 있는지 확인합니다.
+  const hlsInBandParameters = (data, videoId, config, mux) => {
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const seen = new Set(), required = [...config.sps, ...config.pps];
+    const mdats = mux.probe.findBox(data, ["mdat"]);
+    for (const moof of mux.probe.findBox(data, ["moof"])) for (const traf of mux.probe.findBox(moof, ["traf"])) {
+      const headers = mux.probe.findBox(traf, ["tfhd"]);
+      if (headers.length !== 1 || headers[0].length < 8) throw new Error("MP4 조각의 영상 트랙을 확인하지 못했습니다.");
+      const header = headers[0], headerView = new DataView(header.buffer, header.byteOffset, header.byteLength);
+      if (headerView.getUint32(4) !== videoId) continue;
+      if (headerView.getUint32(0) & 1) throw new Error("절대 데이터 주소를 사용하는 MP4 조각은 지원하지 않습니다.");
+      for (const run of mux.probe.findBox(traf, ["trun"])) {
+        const runView = new DataView(run.buffer, run.byteOffset, run.byteLength);
+        if (run.length < 12) throw new Error("MP4 영상 샘플 표가 불완전합니다.");
+        const flags = runView.getUint32(0) & 0xffffff, count = runView.getUint32(4);
+        if (!(flags & 1) || !(flags & 0x200) || !count || count > 100000) throw new Error("지원하지 않는 MP4 영상 샘플 표입니다.");
+        let cursor = 12 + (flags & 4 ? 4 : 0);
+        let offset = moof.byteOffset - data.byteOffset - 8 + runView.getInt32(8);
+        for (let index = 0; index < count; index++) {
+          if (flags & 0x100) cursor += 4;
+          if (cursor + 4 > run.length) throw new Error("MP4 영상 샘플 크기가 불완전합니다.");
+          const size = runView.getUint32(cursor); cursor += 4;
+          if (flags & 0x400) cursor += 4;
+          if (flags & 0x800) cursor += 4;
+          const end = offset + size;
+          if (size < 5 || cursor > run.length || !mdats.some(mdat => {
+            const start = mdat.byteOffset - data.byteOffset;
+            return offset >= start && end <= start + mdat.length;
+          })) throw new Error("MP4 영상 샘플이 데이터 범위를 벗어났습니다.");
+          while (offset < end) {
+            if (offset + 4 > end) throw new Error("H.264 NAL 길이가 불완전합니다.");
+            const length = view.getUint32(offset); offset += 4;
+            if (!length || offset + length > end) throw new Error("H.264 NAL이 샘플 범위를 벗어났습니다.");
+            const nal = data.subarray(offset, offset + length);
+            if ((nal[0] & 31) === 7 || (nal[0] & 31) === 8) required.forEach((parameter, id) => {
+              if (hlsSameBytes(parameter, nal)) seen.add(id);
+            });
+            if ((nal[0] & 31) === 5 && seen.size === required.length) return true;
+            offset += length;
+          }
+        }
+      }
+    }
+    return false;
+  };
   const readHls = async (url, first, options, signal) => {
     const playlistLimit = Math.min(options.maxFileBytes, 2 * 1024 ** 2), seen = new Set();
     let source = first, list;
@@ -1054,12 +1228,13 @@
     if (!list?.segments) throw new Error("HLS 재생목록의 중첩 제한을 넘었습니다.");
     const mux = createHlsMux(), transmuxer = new mux.Transmuxer({ remux: true });
     const parts = [];
-    let size = 0, downloaded = 0, crc = 0xffffffff, init = null, trackKey = null, outputs = 0;
+    let size = 0, downloaded = 0, init = null, previousInit = null, trackKey = null, outputs = 0;
+    let baseAvc = null, baseWithoutColor = null, inBandAvc = false, colorConfigurationChanges = 0;
     let width = 0, height = 0, hasAudio = false, muxError = null;
     const append = bytes => {
       size += bytes.byteLength;
       if (size > options.maxFileBytes) throw new Error("합친 MP4의 크기 제한을 넘었습니다.");
-      crc = crcUpdate(crc, bytes); parts.push(bytes.slice());
+      parts.push(bytes.slice());
     };
     transmuxer.on("error", error => { muxError = error instanceof Error ? error : new Error(String(error)); });
     transmuxer.on("data", segment => {
@@ -1069,15 +1244,37 @@
         throw new Error("TS 영상 조각에서 지원하는 H.264 영상을 확인하지 못했습니다.");
       }
       const key = JSON.stringify(tracks);
-      if (trackKey !== null && (key !== trackKey || init.length !== segment.initSegment.length ||
-          init.some((byte, i) => byte !== segment.initSegment[i]))) {
-        throw new Error("HLS 중간에 코덱·해상도·트랙 정보가 바뀌었습니다.");
+      if (trackKey !== null && key !== trackKey) throw new Error("HLS 중간에 코덱·해상도·트랙 정보가 바뀌었습니다.");
+      let config = null;
+      if (init && !hlsSameBytes(init, segment.initSegment)) {
+        try {
+          baseAvc ||= hlsAvcInit(init, mux);
+          baseWithoutColor ||= hlsInitWithoutColor(init, baseAvc);
+          config = hlsAvcInit(segment.initSegment, mux);
+          if (!hlsSameBytes(baseWithoutColor, hlsInitWithoutColor(segment.initSegment, config))) throw new Error("색상 이외의 초기화 정보 변경");
+        } catch (error) { throw new Error(`HLS 중간에 코덱·해상도·트랙 정보가 바뀌었습니다. (${error.message})`); }
+        if (!inBandAvc) {
+          const videoId = tracks.find(track => track.type === "video").id;
+          if (parts.slice(1).some(bytes => !hlsInBandParameters(bytes, videoId, baseAvc, mux))) {
+            throw new Error("이전 영상 조각의 색상 SPS·PPS를 IDR 프레임에서 확인하지 못했습니다. 불완전한 MP4는 저장하지 않습니다.");
+          }
+        }
+        inBandAvc = true;
+      }
+      if (inBandAvc) {
+        config ||= hlsAvcInit(segment.initSegment, mux);
+        const videoId = tracks.find(track => track.type === "video").id;
+        if (!hlsInBandParameters(segment.data, videoId, config, mux)) {
+          throw new Error("변경된 색상 SPS·PPS를 영상의 IDR 프레임에서 확인하지 못했습니다. 불완전한 MP4는 저장하지 않습니다.");
+        }
+        if (previousInit && !hlsSameBytes(previousInit, segment.initSegment)) colorConfigurationChanges++;
       }
       if (!init) { init = segment.initSegment.slice(); trackKey = key; append(init); }
       if (!segment.data.byteLength) throw new Error("MP4 영상 조각이 비어 있습니다.");
       append(segment.data); outputs++;
       width = segment.info?.width || width; height = segment.info?.height || height;
       hasAudio ||= tracks.some(track => track.type === "audio");
+      previousInit = segment.initSegment.slice();
     });
     try {
       for (const [index, segment] of list.segments.entries()) {
@@ -1097,15 +1294,19 @@
       }
       if (signal.aborted) throw new Error("사용자가 중단했습니다.");
       if (!init || !width || !height) throw new Error("완성된 MP4의 영상 정보를 확인하지 못했습니다.");
+      if (inBandAvc) parts[0].set([97, 118, 99, 51], baseAvc.typeOffset); // avc1 → avc3; 샘플 바이트·색상 설정은 그대로 보존합니다.
+      let crc = 0xffffffff;
+      for (const bytes of parts) crc = crcUpdate(crc, bytes);
       return { blob: new Blob(parts, { type: "video/mp4" }), size, crc: (crc ^ 0xffffffff) >>> 0,
         extension: ".mp4", httpStatus: first.httpStatus, contentType: "video/mp4", width, height, hasAudio,
         segments: list.segments.length, playlistUrl: first.resolvedUrl || url, format: "fragmented-mp4",
+        ...(inBandAvc ? { avcInBandParameterSets: true, colorConfigurationChanges } : {}),
         playlistDurationSeconds: list.segments.reduce((sum, segment) => sum + segment.duration, 0) };
     } finally { transmuxer.dispose(); }
   };
   let downloadController = null, downloadReport = null;
   window.mediaGrab = {
-    version: "2026.10.13.1",
+    version: "2026.10.14.1",
     get exportFilename() { return manifestFilename(document.URL || document.location?.href || document.baseURI); },
     get rows() { return ordered(); },
     get urls() { return this.rows.map(r => r.url); },
@@ -1248,7 +1449,9 @@
               if (data.segments) Object.assign(result, { segments: data.segments, format: data.format,
                 width: data.width, height: data.height, hasAudio: data.hasAudio,
                 playlistUrl: data.playlistUrl, playlistDurationSeconds: data.playlistDurationSeconds,
-                message: `HLS 영상 조각 ${data.segments}개를 MP4로 합쳤습니다.` });
+                ...(data.avcInBandParameterSets ? { avcInBandParameterSets: true, colorConfigurationChanges: data.colorConfigurationChanges } : {}),
+                message: `HLS 영상 조각 ${data.segments}개를 MP4로 합쳤습니다.` +
+                  (data.avcInBandParameterSets ? ` 색상 설정 변경 ${data.colorConfigurationChanges}회를 원본 SPS·PPS와 함께 보존했습니다.` : "") });
               if (result.status === "playlist") result.message = "재생목록만 저장합니다. 영상 조각을 합치지는 않습니다.";
             } catch (error) {
               Object.assign(result, { status: signal.aborted ? "skipped" : "failed", message: error.message,

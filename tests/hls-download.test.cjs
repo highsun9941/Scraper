@@ -14,10 +14,10 @@ const ffprobe = process.env.SCRAPER_TEST_FFPROBE || 'ffprobe';
 const available = spawnSync(ffmpeg, ['-version']).status === 0 && spawnSync(ffprobe, ['-version']).status === 0;
 const mediaTest = (name, fn) => test(name, { skip: !available && 'FFmpeg/FFprobe are needed only for developer verification' }, fn);
 
-function encode(folder, name, audio = true) {
-  const args = ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=96x64:rate=10'];
+function encode(folder, name, audio = true, duration = 2, size = '96x64') {
+  const args = ['-v', 'error', '-y', '-f', 'lavfi', '-i', `testsrc2=size=${size}:rate=10`];
   if (audio) args.push('-f', 'lavfi', '-i', 'sine=frequency=500:sample_rate=48000');
-  args.push('-t', '2', '-c:v', 'libx264', '-threads', '1', '-pix_fmt', 'yuv420p', '-g', '10', '-sc_threshold', '0');
+  args.push('-t', String(duration), '-c:v', 'libx264', '-threads', '1', '-pix_fmt', 'yuv420p', '-g', '10', '-sc_threshold', '0');
   if (audio) args.push('-c:a', 'aac');
   args.push('-f', 'hls', '-hls_time', '1', '-hls_playlist_type', 'vod', join(folder, name + '.m3u8'));
   const result = spawnSync(ffmpeg, args, { encoding: 'utf8' });
@@ -63,6 +63,128 @@ function decodeHashes(path) {
   assert.equal(result.stderr, '');
   return result.stdout.split('\n').filter(line => line && !line.startsWith('#')).map(line => line.split(',').at(-1).trim());
 }
+function remuxTs(input, output, extra) {
+  const result = spawnSync(ffmpeg, ['-v', 'error', '-y', '-copyts', '-i', input, '-c', 'copy', ...extra,
+    '-mpegts_copyts', '1', '-f', 'mpegts', output], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr || String(result.error));
+}
+function frameColors(path) {
+  const result = spawnSync(ffprobe, ['-v', 'error', '-select_streams', 'v:0', '-show_entries',
+    'frame=color_range,color_space,color_transfer,color_primaries', '-of', 'json', path], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout).frames.map(frame => ['color_range', 'color_space', 'color_transfer', 'color_primaries']
+    .map(key => frame[key] || null));
+}
+// Preserve PES lengths and timestamps while putting the first parameter sets
+// before the AUD. mux.js retains their init config but omits those leading NALs
+// from the first MP4 sample, so this is a real missing-inband-parameters fixture.
+function parametersBeforeAud(input) {
+  const output = Buffer.from(input), positions = [];
+  let videoPid = null;
+  for (let packet = 0; packet < input.length; packet += 188) {
+    assert.equal(input[packet], 0x47);
+    const pid = ((input[packet + 1] & 31) << 8) | input[packet + 2];
+    const control = (input[packet + 3] >> 4) & 3;
+    if (!(control & 1)) continue;
+    let start = packet + 4;
+    if (control & 2) start += 1 + input[start];
+    if (start >= packet + 188) continue;
+    if (input[packet + 1] & 0x40) {
+      if (input[start] === 0 && input[start + 1] === 0 && input[start + 2] === 1 &&
+          input[start + 3] >= 0xe0 && input[start + 3] <= 0xef) videoPid = pid;
+      if (pid === videoPid) start += 9 + input[start + 8];
+    }
+    if (pid === videoPid) for (let index = start; index < packet + 188; index++) positions.push(index);
+  }
+  const elementary = Buffer.from(positions.map(index => input[index])), nals = [];
+  for (let index = 0; index + 4 < elementary.length; index++) {
+    const size = elementary[index] === 0 && elementary[index + 1] === 0 ?
+      elementary[index + 2] === 1 ? 3 : elementary[index + 2] === 0 && elementary[index + 3] === 1 ? 4 : 0 : 0;
+    if (size) { nals.push({ start: index, type: elementary[index + size] & 31 }); index += size - 1; }
+  }
+  assert.deepEqual(nals.slice(0, 3).map(nal => nal.type), [9, 7, 8]);
+  const end = nals[3].start;
+  const reordered = Buffer.concat([elementary.subarray(nals[1].start, end), elementary.subarray(0, nals[1].start)]);
+  assert.equal(reordered.length, end);
+  for (let index = 0; index < reordered.length; index++) output[positions[index]] = reordered[index];
+  return output;
+}
+
+mediaTest('color VUI presence changes and restoration produce avc3 with unchanged pixels, audio and per-frame color metadata', async t => {
+  const folder = fs.mkdtempSync(join(tmpdir(), 'scraper-hls-color-'));
+  t.after(() => fs.rmSync(folder, { recursive: true, force: true }));
+  encode(folder, 'av', true, 3);
+  remuxTs(join(folder, 'av1.ts'), join(folder, 'color1.ts'), ['-bsf:v',
+    'h264_metadata=video_full_range_flag=0:colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1']);
+  const playlist = fs.readFileSync(join(folder, 'av.m3u8'), 'utf8').replace('av1.ts', 'color1.ts');
+  fs.writeFileSync(join(folder, 'mixed.m3u8'), playlist);
+  const server = await serve(t, (request, response) => response.end(fs.readFileSync(join(folder, request.url.slice(1)))));
+  const { grab, archives } = runtime(server.base, ['/thumbnail.jpg', '/mixed.m3u8']);
+  const report = await grab.download({ hls: 'mp4', start: 2, end: 2 });
+  const row = report.results[0];
+  assert.equal(row.status, 'packed', row.message);
+  assert.equal(row.filename, '0002.mp4');
+  assert.equal(row.avcInBandParameterSets, true);
+  assert.equal(row.colorConfigurationChanges, 2);
+  const files = await unzip(archives[0]), output = join(folder, 'result.mp4');
+  assert.deepEqual(mediaFiles(files), ['0002.mp4']);
+  fs.writeFileSync(output, files['0002.mp4']);
+  const hashes = decodeHashes(output);
+  assert.equal(hashes.length, 30);
+  assert.deepEqual(hashes, decodeHashes(join(folder, 'mixed.m3u8')));
+  const expectedColors = frameColors(join(folder, 'mixed.m3u8'));
+  assert.notDeepEqual(expectedColors[0], expectedColors[10], 'fixture must really change the color VUI');
+  assert.deepEqual(frameColors(output), expectedColors);
+  const audioHash = path => {
+    const result = spawnSync(ffmpeg, ['-v', 'error', '-i', path, '-map', '0:a:0', '-f', 'hash', '-'], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr); assert.equal(result.stderr, '');
+    return result.stdout;
+  };
+  assert.equal(audioHash(output), audioHash(join(folder, 'mixed.m3u8')));
+  const probe = spawnSync(ffprobe, ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_tag_string,width,height', '-of', 'json', output], { encoding: 'utf8' });
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.deepEqual(JSON.parse(probe.stdout).streams[0], { codec_tag_string: 'avc3', width: 96, height: 64 });
+  assert.equal(JSON.parse(files['download-report.json']).results[0].colorConfigurationChanges, 2);
+});
+
+mediaTest('resolution, sample aspect ratio and same-rate audio channel changes remain failures after allowing color VUI changes', async t => {
+  const folder = fs.mkdtempSync(join(tmpdir(), 'scraper-hls-noncolor-'));
+  t.after(() => fs.rmSync(folder, { recursive: true, force: true })); encode(folder, 'av');
+  remuxTs(join(folder, 'av1.ts'), join(folder, 'aspect.ts'), ['-bsf:v', 'h264_metadata=sample_aspect_ratio=2/1']);
+  remuxTs(join(folder, 'av1.ts'), join(folder, 'stereo.ts'), ['-c:a', 'aac', '-ar', '48000', '-ac', '2']);
+  encode(folder, 'wide', true, 2, '128x64');
+  const source = fs.readFileSync(join(folder, 'av.m3u8'), 'utf8');
+  fs.writeFileSync(join(folder, 'aspect.m3u8'), source.replace('av1.ts', 'aspect.ts'));
+  fs.writeFileSync(join(folder, 'stereo.m3u8'), source.replace('av1.ts', 'stereo.ts'));
+  fs.writeFileSync(join(folder, 'resolution.m3u8'), source.replace('av1.ts', 'wide1.ts'));
+  const server = await serve(t, (request, response) => response.end(fs.readFileSync(join(folder, request.url.slice(1)))));
+  const { grab, archives } = runtime(server.base, ['/aspect.m3u8', '/stereo.m3u8', '/resolution.m3u8', '/av.m3u8']);
+  const report = await grab.downloadHls();
+  assert.deepEqual(Array.from(report.results, row => row.status), ['failed', 'failed', 'failed', 'packed']);
+  assert.match(report.results[0].message, /코덱·해상도·트랙 정보/);
+  assert.match(report.results[1].message, /코덱·해상도·트랙 정보/);
+  assert.match(report.results[2].message, /코덱·해상도·트랙 정보/);
+  assert.deepEqual(mediaFiles(await unzip(archives[0])), ['0004.mp4']);
+  assert.equal(report.results[3].avcInBandParameterSets, undefined, 'unchanged AVC streams retain their existing format');
+});
+
+mediaTest('color changes whose SPS and PPS are missing from MP4 samples are not silently accepted', async t => {
+  const folder = fs.mkdtempSync(join(tmpdir(), 'scraper-hls-missing-parameters-'));
+  t.after(() => fs.rmSync(folder, { recursive: true, force: true })); encode(folder, 'av');
+  remuxTs(join(folder, 'av1.ts'), join(folder, 'color1.ts'), ['-bsf:v',
+    'h264_metadata=video_full_range_flag=0:colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1']);
+  fs.writeFileSync(join(folder, 'before-aud.ts'), parametersBeforeAud(fs.readFileSync(join(folder, 'color1.ts'))));
+  fs.writeFileSync(join(folder, 'first-before-aud.ts'), parametersBeforeAud(fs.readFileSync(join(folder, 'av0.ts'))));
+  fs.writeFileSync(join(folder, 'missing.m3u8'), fs.readFileSync(join(folder, 'av.m3u8'), 'utf8').replace('av1.ts', 'before-aud.ts'));
+  fs.writeFileSync(join(folder, 'missing-first.m3u8'), fs.readFileSync(join(folder, 'av.m3u8'), 'utf8').replace('av0.ts', 'first-before-aud.ts').replace('av1.ts', 'color1.ts'));
+  const server = await serve(t, (request, response) => response.end(fs.readFileSync(join(folder, request.url.slice(1)))));
+  const { grab, archives } = runtime(server.base, ['/missing.m3u8', '/missing-first.m3u8', '/av.m3u8']);
+  const report = await grab.downloadHls();
+  assert.deepEqual(Array.from(report.results, row => row.status), ['failed', 'failed', 'packed']);
+  assert.match(report.results[0].message, /SPS·PPS.*IDR 프레임/);
+  assert.match(report.results[1].message, /SPS·PPS.*IDR 프레임/);
+  assert.deepEqual(mediaFiles(await unzip(archives[0])), ['0003.mp4']);
+});
 
 mediaTest('console HLS selects supported signed variants and preserves every frame, audio and original numbering in a valid ZIP', async t => {
   const folder = fs.mkdtempSync(join(tmpdir(), 'scraper-hls-'));

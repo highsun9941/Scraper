@@ -1026,7 +1026,7 @@ test('JSON manifest preserves full ordered addresses and omits excluded events',
   f.doc.body.append(f.img(long, 500), f.img('/first.jpg', 10));
   const manifest = f.run().getManifest();
   assert.equal(manifest.schema, 'media-grab/1');
-  assert.equal(manifest.collectorVersion, '2026.10.13.1');
+  assert.equal(manifest.collectorVersion, '2026.10.14.1');
   assert.equal(manifest.pageUrl, base);
   assert.equal(manifest.title, '상품 테스트');
   assert.ok(Number.isFinite(Date.parse(manifest.exportedAt)));
