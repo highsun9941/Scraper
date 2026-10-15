@@ -975,6 +975,33 @@ test('ordinary GIFs fetched through fetch or XHR remain in the network collectio
   assert.equal(grab.excludedRows.length, 0);
 });
 
+test('Amazon telemetry is excluded from DOM and network media without dropping CDN files or similar paths', () => {
+  const omit = [
+    'https://www.amazon.com/rd/uedata?rid=test&rx=whole%2Fvalue',
+    'https://amazon.com/rd/uedata?rid=another',
+    'https://fls-na.amazon.com/1/batch/1/OP/test$uedata=s:metrics',
+    'https://fls-na.amazon.com/1/remote-weblab-triggers/1/OE/test$s:wl-client-id=test'
+  ];
+  const keep = [
+    'https://m.media-amazon.com/images/I/product.jpg?signature=whole%2Fvalue',
+    'https://www.amazon.com/rd/uedata.jpg',
+    'https://fls-na.amazon.com/images/animation.gif',
+    'https://fls-na.amazon.com/1/batch/1/OTHER/file.mp4',
+    'https://www.amazon.com.evil.example/rd/uedata',
+    'https://fls-na.amazon.com.evil.example/1/batch/1/OP/image.jpg',
+    'https://www.amazon.com@cdn.example/rd/uedata'
+  ];
+  const f = fixture({ resources: [...omit, ...keep].map(name => ({ name, initiatorType: 'img' })) });
+  f.doc.body.append(f.img(omit[0], 100));
+  const grab = f.run();
+  assert.deepEqual(urls(grab), keep);
+  assert.deepEqual(Array.from(grab.excludedUrls), omit);
+  assert.ok(grab.excludedRows.every(row => /Amazon/.test(row.reason)));
+  grab.scan({ quiet: true });
+  assert.equal(grab.excludedRows.length, omit.length);
+  assert.deepEqual(Array.from(grab.getManifest().items, row => row.url), keep);
+});
+
 test('exclusion is limited to the exact Mercury host and e.gif endpoint', () => {
   const keep = [
     'https://mercury.coupang.com/gallery/animation.gif',
@@ -1026,7 +1053,7 @@ test('JSON manifest preserves full ordered addresses and omits excluded events',
   f.doc.body.append(f.img(long, 500), f.img('/first.jpg', 10));
   const manifest = f.run().getManifest();
   assert.equal(manifest.schema, 'media-grab/1');
-  assert.equal(manifest.collectorVersion, '2026.10.14.1');
+  assert.equal(manifest.collectorVersion, '2026.10.15.1');
   assert.equal(manifest.pageUrl, base);
   assert.equal(manifest.title, '상품 테스트');
   assert.ok(Number.isFinite(Date.parse(manifest.exportedAt)));
@@ -1214,6 +1241,29 @@ test('browser ZIP downloads the original Video.js MP4 source instead of its nati
   assert.deepEqual(files.get('0001.mp4'), bytes);
 });
 
+test('browser ZIP retains readable blob files and reports unresolved blobs without guessing a source', async () => {
+  const readable = 'blob:https://shop.example/complete-file', unresolved = 'blob:https://shop.example/unknown-player';
+  const unrelated = url('/unrelated.mp4');
+  const videoBytes = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypmp42'),
+    Buffer.alloc(4), Buffer.from('mp42isom'), Buffer.from([0, 0, 0, 8]), Buffer.from('mdat')]);
+  const f = downloadFixture({
+    [readable]: new Response(videoBytes), [unresolved]: new TypeError('Failed to fetch'),
+    [unrelated]: new Response(videoBytes)
+  });
+  for (const src of [readable, unresolved, unrelated]) f.doc.body.append(f.element('video', { attrs: { src } }));
+  const report = await f.run().download();
+  assert.deepEqual(Array.from(report.results, row => [row.status, row.filename]),
+    [['packed', '0001.mp4'], ['failed', ''], ['packed', '0003.mp4']]);
+  assert.match(report.results[1].message, /임시 blob/);
+  assert.match(report.results[1].message, /원본 MP4·HLS 확인/);
+  assert.equal(report.results[1].url, unresolved);
+  const files = await zipFiles(f.blobs.get(report.archives[0].url));
+  assert.deepEqual(files.get('0001.mp4'), videoBytes);
+  assert.deepEqual(files.get('0003.mp4'), videoBytes);
+  assert.ok(!files.has('0002.mp4'));
+  assert.match(files.get('failed.csv').toString(), /unknown-player/);
+});
+
 test('browser ZIP rejects OK, HTML, JSON, HTTP errors and unreadable responses without saving false media', async () => {
   const f = downloadFixture({
     [url('/ok.gif')]: new Response('OK', { headers: { 'Content-Type': 'image/gif' } }),
@@ -1300,10 +1350,10 @@ test('browser ZIP cancellation retains a report and prevents overlapping downloa
   assert.equal(f.requests.length, 1);
 });
 
-test('browser ZIP stores stream playlists without claiming a complete video', async () => {
+test('explicit playlist option stores stream playlists without claiming a complete video', async () => {
   const f = downloadFixture({ [url('/video.m3u8')]: new Response('#EXTM3U\npart.ts\n') });
   f.doc.body.append(f.element('a', { attrs: { href: '/video.m3u8' } }));
-  const result = await f.run().download();
+  const result = await f.run().download({ hls: 'playlist' });
   assert.equal(result.results[0].status, 'playlist');
   assert.equal(result.results[0].filename, '0001.m3u8');
   assert.match(result.results[0].message, /영상 조각/);
