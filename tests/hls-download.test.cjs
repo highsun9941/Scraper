@@ -57,6 +57,52 @@ with zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())) as z:
   return Object.fromEntries(Object.entries(JSON.parse(result.stdout)).map(([name, bytes]) => [name, Buffer.from(bytes, 'base64')]));
 }
 const mediaFiles = files => Object.keys(files).filter(name => /^\d/.test(name));
+
+mediaTest('default console download packs images, direct MP4 and HLS while excluding telemetry and retaining an unresolved blob', async t => {
+  const folder = fs.mkdtempSync(join(tmpdir(), 'scraper-console-default-'));
+  t.after(() => fs.rmSync(folder, { recursive: true, force: true }));
+  encode(folder, 'av');
+  const direct = join(folder, 'direct.mp4');
+  const remux = spawnSync(ffmpeg, ['-v', 'error', '-y', '-i', join(folder, 'av.m3u8'), '-c', 'copy', direct], { encoding: 'utf8' });
+  assert.equal(remux.status, 0, remux.stderr);
+  const gif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+  const blob = 'blob:https://shop.example/unresolved-player';
+  const telemetry = 'https://fls-na.amazon.com/1/batch/1/OP/test$uedata=s:metrics';
+  const resources = ['/thumbnail.gif', '/direct.mp4', '/av.m3u8', telemetry, blob];
+  const server = await serve(t, (request, response) => {
+    resources.push(request.url);
+    response.setHeader('Access-Control-Allow-Origin', '*');
+    if (request.url === '/thumbnail.gif') response.end(gif);
+    else if (/^\/(?:direct\.mp4|av\.m3u8|av[01]\.ts)$/.test(request.url)) {
+      response.end(fs.readFileSync(join(folder, request.url.slice(1))));
+    } else assert.fail('unexpected request ' + request.url);
+  });
+  const calls = [];
+  const { grab, archives } = runtime(server.base, resources, (href, options) => {
+    calls.push(href);
+    if (href === blob) return Promise.reject(new TypeError('Failed to fetch'));
+    assert.notEqual(href, telemetry, 'telemetry must never be requested by the downloader');
+    return fetch(href, options);
+  });
+  const report = await grab.download();
+  assert.deepEqual(Array.from(report.results, row => [row.order, row.status, row.filename]),
+    [[1, 'packed', '0001.gif'], [2, 'packed', '0002.mp4'], [3, 'packed', '0003.mp4'], [4, 'failed', '']]);
+  assert.equal(report.results[2].segments, 2);
+  assert.match(report.results[3].message, /원본 MP4·HLS 확인/);
+  assert.deepEqual(Array.from(grab.excludedUrls), [telemetry]);
+  assert.ok(calls.includes(new URL('/av1.ts', server.base).href));
+  assert.deepEqual(Array.from(grab.getManifest().items, row => row.url),
+    ['/thumbnail.gif', '/direct.mp4', '/av.m3u8', blob].map(href => new URL(href, server.base).href));
+  const files = await unzip(archives[0]);
+  assert.deepEqual(mediaFiles(files), ['0001.gif', '0002.mp4', '0003.mp4']);
+  assert.deepEqual(files['0001.gif'], gif);
+  assert.deepEqual(files['0002.mp4'], fs.readFileSync(direct));
+  const output = join(folder, 'merged.mp4'); fs.writeFileSync(output, files['0003.mp4']);
+  assert.deepEqual(decodeHashes(output), decodeHashes(join(folder, 'av.m3u8')));
+  assert.match(files['failed.csv'].toString(), /unresolved-player/);
+  assert.ok(!files['failed.csv'].toString().includes(telemetry));
+});
+
 function decodeHashes(path) {
   const result = spawnSync(ffmpeg, ['-v', 'error', '-threads', '1', '-i', path, '-map', '0:v:0', '-f', 'framemd5', '-'], { encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr || String(result.error));

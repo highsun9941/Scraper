@@ -76,9 +76,13 @@
       if (u.protocol === "data:" && !/^data:(?:image|video)\//i.test(href)) return;
       // 확장자가 .gif여도 이벤트 수집용 엔드포인트는 미디어가 아닙니다.
       // 알려진 정확한 주소만 제외해 일반 GIF와 영상 요청은 유지합니다.
-      if (u.hostname === "mercury.coupang.com" && u.pathname === "/e.gif") {
+      const amazonTelemetry = /^(?:www\.)?amazon\.com$/.test(u.hostname) && u.pathname === "/rd/uedata" ||
+        u.hostname === "fls-na.amazon.com" && /^\/1\/(?:batch\/1\/OP|remote-weblab-triggers\/1\/OE)\//.test(u.pathname);
+      const telemetry = u.hostname === "mercury.coupang.com" && u.pathname === "/e.gif" ? "Coupang Mercury" :
+        amazonTelemetry ? "Amazon" : "";
+      if (telemetry) {
         if (!excluded.has(href)) excluded.set(href, {
-          url: href, source, reason: "통계·이벤트 수집 주소 (Coupang Mercury)"
+          url: href, source, reason: `통계·이벤트 수집 주소 (${telemetry})`
         });
         return;
       }
@@ -952,7 +956,10 @@
         resolvedUrl: response.url || url };
     } catch (error) {
       const message = signal.aborted ? "사용자가 중단했습니다." : controller.signal.aborted ? "요청 대기 시간을 넘었습니다." :
-        error?.name === "TypeError" ? `브라우저에서 응답을 읽지 못했습니다(CORS·CSP·접속 제한 등): ${error.message}` : error.message;
+        error?.name === "TypeError" ? (url.startsWith("blob:") ?
+          "임시 blob 주소를 파일로 읽지 못했습니다. MediaSource 재생용이거나 이미 해제된 주소일 수 있습니다. " +
+          "이 주소의 원본 MP4·HLS 확인이 필요합니다." :
+          `브라우저에서 응답을 읽지 못했습니다(CORS·CSP·접속 제한 등): ${error.message}`) : error.message;
       const failure = new Error(message);
       failure.httpStatus = response?.status || ""; failure.contentType = response?.headers.get("Content-Type") || "";
       throw failure;
@@ -1306,7 +1313,7 @@
   };
   let downloadController = null, downloadReport = null;
   window.mediaGrab = {
-    version: "2026.10.14.1",
+    version: "2026.10.15.1",
     get exportFilename() { return manifestFilename(document.URL || document.location?.href || document.baseURI); },
     get rows() { return ordered(); },
     get urls() { return this.rows.map(r => r.url); },
@@ -1388,7 +1395,7 @@
       return this.download({ ...options, streamsOnly: true, hls: "mp4" });
     },
     async download({ visibleOnly = false, start = 1, end = Infinity, maxFileMB = 256,
-        maxZipMB = 256, timeoutMs = 30000, credentials = "same-origin", streamsOnly = false, hls = "playlist" } = {}) {
+        maxZipMB = 256, timeoutMs = 30000, credentials = "same-origin", streamsOnly = false, hls = "mp4" } = {}) {
       if (downloadController) throw new Error("이미 다운로드 중입니다. 중단하려면 mediaGrab.stopDownload()를 실행하세요.");
       this.scan({ quiet: true });
       if (![maxFileMB, maxZipMB].every(x => Number.isFinite(x) && x > 0 && x <= 1024) ||
@@ -1433,7 +1440,7 @@
             if (entries.length && partBytes + link.size > zipLimit) flush();
             entries.push(link); partBytes += link.size;
             Object.assign(result, { status: "link", filename, bytes: link.size,
-              message: "유튜브 영상 페이지 링크를 저장했습니다. 영상 파일은 download-videos.py로 다운로드하세요." });
+              message: "유튜브 영상 페이지 링크를 저장했습니다. 영상 파일은 포함되지 않았습니다." });
           } else {
             try {
               const firstOptions = hls === "mp4" && row.type === "STREAM" ?
@@ -1523,9 +1530,9 @@
       console.table(rows);
       console.log(`총 ${found.size}개 URL (페이지 좌표 순서, 위치 미확인 주소는 뒤쪽)\n${rows.map(r => r.url).join("\n")}`);
       console.log(`표시 요소의 선택 주소 ${this.visibleUrls.length}개: copy(mediaGrab.visibleUrls.join('\\n'))`);
-      console.log("기본 다운로드: mediaGrab.export() → 저장한 JSON을 download-media.cmd에 드래그 (이미지·GIF·MP4)");
-      console.log("선택: 브라우저에서 ZIP 다운로드: await mediaGrab.download() (CORS·CSP 등으로 실패할 수 있음)");
-      console.log("설치 없이 HLS 리뷰 영상을 MP4 ZIP으로 저장: await mediaGrab.downloadHls()");
+      console.log("기본 다운로드: await mediaGrab.download() (이미지·GIF·직접 영상 + 지원하는 HLS를 MP4로 병합해 ZIP 저장)");
+      console.log("HLS만 저장: await mediaGrab.downloadHls() / 병합 없이 재생목록만: await mediaGrab.download({hls:\"playlist\"})");
+      console.log("선택: 주소 목록 JSON 저장: mediaGrab.export(). 다운로드 결과와 실패 원인은 mediaGrab.lastDownload에서 확인하세요.");
       if (excluded.size) console.log(`미디어에서 제외한 통계·이벤트 주소 ${excluded.size}개: mediaGrab.excludedRows`);
       if (blockedFrames.size) console.log("접근할 수 없는 iframe:", this.blockedFrames);
       console.log(`외부 영상 링크 ${this.embeds.length}개 / 영상·재생목록 주소 ${this.videos.length - this.embeds.length}개 (MP4·HLS·DASH 등, 같은 영상의 여러 주소 포함 가능) / 미확인 리뷰 영상 ${this.pendingVideos.length}개`);
