@@ -782,6 +782,268 @@ test('Amazon video cards refresh their URL and identity on attribute changes and
   grab.stopWatching();
 });
 
+const amazonThumbIds = ['5103zNzqjuL', '81gZcQ0ihiL', '91m+kKuq1pL', '61Sel6JZ7LL', '61t0iMgg-gL', '51gB21-+2DL',
+  '61A+pxCA72L', '61ycSX5iWkL', '71Mj9ka0vqL', '51Ixi9aekPL', '71xH9-kBzLL', '410-fH9zd8L', '512lOchV77L',
+  '61+yUWlXcYL', '71XeH07-jzL', '51XyDzv8h0L', '61I4BWllVBL', '61fpgZtjymL'];
+const amazonThumb = (id, variant = 'SR342,193') => 'https://m.media-amazon.com/images/I/' + id + '._' + variant + '_.jpg';
+function amazonFixture() {
+  const f = watchFixture({ documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  Object.assign(f.doc.defaultView, { AbortController, Request, setTimeout, clearTimeout });
+  f.context.TextDecoder = TextDecoder;
+  return f;
+}
+// These are declared test records, not recovered URLs for the user's missing
+// videos. The thumbnail identities come from the user's HTML; video URLs are
+// explicitly synthetic so a mocked success cannot be mistaken for a live test.
+const amazonRecord = (i, extra = {}) => ({
+  videoId: 'amzn1.vse.video.fixture-' + i, title: 'Fixture video ' + i,
+  thumbnailUrl: amazonThumb(amazonThumbIds[i]),
+  sources: [{ src: 'https://cdn.example/fixture-' + i + '.m3u8?signature=whole%2Bvalue&literal=a&amp;b',
+    type: 'application/vnd.apple.mpegurl' }], ...extra
+});
+
+test('Amazon a-state JSON captures the full declared list beyond rendered cards and links thumbnail variants', async () => {
+  const f = amazonFixture(), win = f.doc.defaultView;
+  win.fetch = () => assert.fail('initial metadata must not trigger network requests');
+  const records = amazonThumbIds.map((_, i) => amazonRecord(i));
+  for (let i = 0; i < 10; i++) f.doc.body.append(f.img(amazonThumb(amazonThumbIds[i], 'SX180'), 100 + i * 90,
+    20, { attrs: { alt: 'video thumbnail' } }));
+  const script = f.element('script', { attrs: { type: 'a-state', 'data-a-state': '{"key":"fixture-video-list"}' } });
+  script.textContent = JSON.stringify({ title: 'Gallery', imageUrl: amazonThumb('NotAVideo'), videos: records }).replaceAll('/', '\\/');
+  f.doc.body.append(script);
+  const grab = f.run(); await grab.ready;
+  assert.equal(grab.videos.length, 18);
+  assert.equal(grab.pendingVideos.length, 0);
+  assert.equal(grab.amazonCollection.thumbnailsObserved, 18);
+  assert.equal(grab.amazonCollection.thumbnailsWithOriginal, 18);
+  for (const row of grab.videos) {
+    const record = records.find(r => r.videoId === row.videoId);
+    assert.ok(record);
+    assert.equal(row.url, record.sources[0].src);
+    assert.equal(row.thumbnailUrl, record.thumbnailUrl);
+    assert.equal(row.videoTitle, record.title);
+    assert.equal(row.provider, 'amazon');
+    assert.equal(row.source, 'amazon.script');
+  }
+  assert.ok(!grab.urls.includes(amazonThumb('NotAVideo')));
+  assert.ok(grab.videos.find(row => row.videoId === records[0].videoId).top !== null);
+  assert.equal(grab.videos.find(row => row.videoId === records[17].videoId).top, null);
+  grab.stopWatching();
+});
+
+test('Amazon thumbnail-only entries stay pending and an unrelated video never resolves them', () => {
+  const f = amazonFixture();
+  const section = f.element('div', { attrs: { id: 'vftphero-vse-related-videos' } });
+  for (const variant of ['SX180', 'SR342,193']) section.append(f.img(amazonThumb(amazonThumbIds[0], variant), 100));
+  f.doc.body.append(section);
+  const grab = f.run();
+  assert.equal(grab.videos.length, 0);
+  assert.equal(grab.pendingVideos.length, 1);
+  assert.equal(grab.pendingVideos[0].provider, 'amazon');
+  const script = f.element('script', { attrs: { type: 'application/json' } });
+  script.textContent = JSON.stringify(amazonRecord(1));
+  f.doc.body.append(script);
+  f.mutations[0].callback([{ type: 'childList', target: f.doc.body, addedNodes: [script] }]);
+  assert.equal(grab.videos.length, 1);
+  assert.equal(grab.pendingVideos.length, 1);
+  assert.equal(grab.pendingVideos[0].thumbnailUrl, amazonThumb(amazonThumbIds[0], 'SX180'));
+  script.textContent = JSON.stringify(amazonRecord(0));
+  f.mutations[0].callback([{ type: 'characterData', target: { parentElement: script } }]);
+  assert.equal(grab.pendingVideos.length, 0);
+  assert.equal(grab.videos.length, 2, 'the earlier source must remain after state replacement');
+  grab.stopWatching();
+});
+
+test('Amazon hydration metadata retains page coordinates when the rendered thumbnail uses a different crop', () => {
+  const f = amazonFixture(), record = amazonRecord(0);
+  f.doc.defaultView.__INITIAL_STATE__ = { videos: [record] };
+  f.doc.body.append(f.img(amazonThumb(amazonThumbIds[0], 'SX180'), 700, 40, { attrs: { alt: 'video thumbnail' } }));
+  const grab = f.run();
+  assert.equal(grab.videos.length, 1);
+  assert.equal(grab.videos[0].top, 700);
+  assert.equal(grab.videos[0].left, 40);
+  assert.equal(grab.pendingVideos.length, 0);
+  grab.stopWatching();
+});
+
+test('Amazon original URLs on a card resolve only that card thumbnail', () => {
+  const f = amazonFixture(), record = amazonRecord(0);
+  const card = f.element('div', { attrs: { class: 'vse-video-card', 'data-video-url': record.sources[0].src,
+    'data-title': record.title, 'data-aci-content-id': record.videoId } });
+  card.append(f.img(record.thumbnailUrl, 100));
+  f.doc.body.append(card, f.img(amazonThumb(amazonThumbIds[1]), 200, 0, { attrs: { alt: 'video thumbnail' } }));
+  const grab = f.run();
+  assert.equal(grab.videos.length, 1);
+  assert.equal(grab.videos[0].thumbnailUrl, record.thumbnailUrl);
+  assert.equal(grab.pendingVideos.length, 1);
+  assert.equal(grab.pendingVideos[0].thumbnailUrl, amazonThumb(amazonThumbIds[1]));
+  assert.equal(grab.getManifest().amazonCollection.pendingThumbnails, 1);
+  grab.stopWatching();
+});
+
+test('Amazon JSON.parse strings and inline JSON objects are read without executing scripts or rewriting signatures', () => {
+  const f = amazonFixture(), one = amazonRecord(0), two = amazonRecord(1);
+  for (const text of [
+    'window.fixtureRan = true; const list = JSON.parse(' + JSON.stringify(JSON.stringify({ videos: [one] })) + ');',
+    'A.state("fixture-list", ' + JSON.stringify({ videos: [two] }) + '); window.fixtureRan = true;',
+    '// "https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-test/comment/fake.mp4"\n' +
+      '/* "https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-test/comment/fake.m3u8" */'
+  ]) { const script = f.element('script'); script.textContent = text; f.doc.body.append(script); }
+  const grab = f.run();
+  assert.equal(f.doc.defaultView.fixtureRan, undefined);
+  assert.deepEqual(new Set(Array.from(grab.videos, row => row.url)), new Set([one.sources[0].src, two.sources[0].src]));
+  assert.equal(grab.pendingVideos.length, 0);
+  assert.ok(grab.videos.every(row => row.url.endsWith('&literal=a&amp;b')));
+  grab.stopWatching();
+});
+
+test('Amazon hydration and React records preserve sources while skipping getters, audio and segment URLs', () => {
+  const f = amazonFixture(), win = f.doc.defaultView, record = amazonRecord(0);
+  win.__INITIAL_STATE__ = { productVideos: [record], audio: { sources: [{ src: 'https://cdn.example/audio.mp4', type: 'audio/mp4' }] },
+    videos: ['amzn1.vse.video.id-without-a-url', { videoUrl: 'https://cdn.example/segment.ts' }] };
+  const image = f.img(amazonThumb(amazonThumbIds[1]), 300, 0, { attrs: { alt: 'video thumbnail' } });
+  const props = { video: amazonRecord(1) }; props.cycle = props;
+  Object.defineProperty(props, 'videoUrl', { get() { assert.fail('getter must not run'); } });
+  Object.defineProperty(image, '__reactProps$fixture', { value: props });
+  f.doc.body.append(image);
+  const grab = f.run();
+  assert.equal(grab.videos.length, 2);
+  assert.deepEqual(new Set(Array.from(grab.videos, row => row.videoId)), new Set([record.videoId, amazonRecord(1).videoId]));
+  assert.equal(grab.pendingVideos.length, 0);
+  assert.ok(!grab.urls.some(href => /audio\.mp4|segment\.ts|id-without-a-url/.test(href)));
+  grab.stopWatching();
+});
+
+test('Amazon observed POST video-list responses preserve the page body and are never replayed', async () => {
+  const f = amazonFixture(), win = f.doc.defaultView, calls = [];
+  const record = amazonRecord(0), response = new Response(JSON.stringify({ videos: [record] }),
+    { headers: { 'Content-Type': 'application/json' } });
+  const promise = Promise.resolve(response);
+  win.fetch = (...args) => { calls.push(args); return promise; };
+  f.doc.body.append(f.img(record.thumbnailUrl, 100, 0, { attrs: { alt: 'video thumbnail' } }));
+  const grab = f.run(); await grab.ready;
+  const result = win.fetch('/gp/video/list', { method: 'POST', body: 'fixture=unchanged' });
+  assert.equal(result, promise);
+  assert.equal(await result, response);
+  assert.equal(JSON.parse(await response.text()).videos[0].videoId, record.videoId);
+  await grab.collectVideos();
+  assert.equal(calls.length, 1);
+  assert.equal(grab.videos.length, 1);
+  assert.equal(grab.videos[0].url, record.sources[0].src);
+  assert.equal(grab.videos[0].source, 'amazon.fetch');
+  assert.equal(grab.pendingVideos.length, 0);
+  grab.stopWatching();
+});
+
+test('Amazon JSON attributes and late state remain captured after their DOM nodes close', () => {
+  const f = amazonFixture(), record = amazonRecord(0);
+  const node = f.element('div', { attrs: { 'data-video-data': JSON.stringify(record) } });
+  f.doc.body.append(node);
+  const grab = f.run();
+  assert.equal(grab.videos.length, 1);
+  node.attrs['data-video-data'] = JSON.stringify(amazonRecord(1));
+  f.mutations[0].callback([{ type: 'attributes', target: node, attributeName: 'data-video-data' }]);
+  f.doc.body.children = [];
+  node.isConnected = false;
+  f.mutations[0].callback([{ type: 'childList', target: f.doc.body, removedNodes: [node] }]);
+  assert.equal(grab.getManifest().items.filter(row => row.type === 'STREAM').length, 2);
+  assert.equal(grab.pendingVideos.length, 0);
+  grab.stopWatching();
+});
+
+test('Amazon list HTTP errors remain visible without consuming the page body and clear after a real successful response', async () => {
+  const f = amazonFixture(), win = f.doc.defaultView, record = amazonRecord(0);
+  const responses = [new Response('fixture service unavailable', { status: 503 }),
+    new Response(JSON.stringify({ videos: [record] }), { headers: { 'Content-Type': 'application/json' } })];
+  let calls = 0;
+  win.fetch = () => Promise.resolve(responses[calls++]);
+  f.doc.body.append(f.img(record.thumbnailUrl, 100, 0, { attrs: { alt: 'video thumbnail' } }));
+  const grab = f.run(); await grab.ready;
+  const failed = await win.fetch('/gp/video/list', { method: 'POST' });
+  assert.equal(await failed.text(), 'fixture service unavailable');
+  await grab.collectVideos();
+  assert.equal(calls, 1);
+  assert.equal(grab.pendingVideos.length, 1);
+  assert.match(grab.amazonCollection.errors[0].message, /503/);
+  const success = await win.fetch('/gp/video/list', { method: 'POST' });
+  assert.equal(JSON.parse(await success.text()).videos[0].videoId, record.videoId);
+  await grab.collectVideos();
+  assert.equal(calls, 2);
+  assert.equal(grab.pendingVideos.length, 0);
+  assert.equal(grab.amazonCollection.errors.length, 0);
+  grab.stopWatching();
+});
+
+test('Amazon oversized state reports its limit instead of claiming video completeness', () => {
+  const f = amazonFixture(), script = f.element('script', { attrs: { type: 'a-state' } });
+  script.textContent = JSON.stringify({ videos: [amazonRecord(0)], padding: 'x'.repeat(2 * 1024 ** 2) });
+  f.doc.body.append(script, f.img(amazonThumb(amazonThumbIds[0]), 100, 0, { attrs: { alt: 'video thumbnail' } }));
+  const grab = f.run();
+  assert.equal(grab.videos.length, 0);
+  assert.equal(grab.pendingVideos.length, 1);
+  assert.ok(grab.amazonCollection.limitsReached.length);
+  grab.stopWatching();
+});
+
+test('the user thumbnail shapes identify 18 pending previews without inventing any of their video URLs', () => {
+  const f = amazonFixture(), related = f.element('div', { attrs: { id: 'vftphero-vse-related-videos' } });
+  for (let i = 0; i < 6; i++) f.doc.body.append(f.img(amazonThumb(amazonThumbIds[i]), 100 + i * 90, 0,
+    { attrs: { alt: 'video thumbnail' } }));
+  for (let i = 6; i < 10; i++) {
+    const card = f.element('div', { attrs: { 'data-element-id': 'video-thumbnail' } });
+    card.append(f.img(amazonThumb(amazonThumbIds[i]), 700 + i * 90, 0, { attrs: { alt: 'Review title ' + i } }));
+    card.outerHTML = '<div data-element-id="video-thumbnail"><img src="' + amazonThumb(amazonThumbIds[i]) + '"></div>';
+    f.doc.body.append(card);
+  }
+  for (const i of [10, 1, 11, 12, 13, 4, 14, 15, 16, 17]) related.append(f.img(amazonThumb(amazonThumbIds[i]), 1500 + i * 90));
+  f.doc.body.append(related);
+  const grab = f.run();
+  assert.equal(grab.videos.length, 0);
+  assert.equal(grab.pendingVideos.length, 18);
+  assert.equal(grab.amazonCollection.thumbnailsObserved, 18);
+  assert.equal(grab.amazonCollection.thumbnailsWithOriginal, 0);
+  assert.ok(grab.pendingVideos.some(row => row.cardHtml?.includes('video-thumbnail')));
+  assert.ok(grab.rows.every(row => row.type === 'IMAGE'));
+  grab.stopWatching();
+});
+
+test('Amazon video JSON-LD retains the actual encoding URL and associates its thumbnail', () => {
+  const f = amazonFixture(), record = amazonRecord(0);
+  const script = f.element('script', { attrs: { type: 'application/ld+json' } });
+  script.textContent = JSON.stringify({ '@type': 'VideoObject', name: record.title, thumbnailUrl: record.thumbnailUrl,
+    encoding: { contentUrl: record.sources[0].src } });
+  f.doc.body.append(script);
+  const grab = f.run();
+  assert.equal(grab.videos.length, 1);
+  assert.equal(grab.videos[0].url, record.sources[0].src);
+  assert.equal(grab.videos[0].videoTitle, record.title);
+  assert.equal(grab.pendingVideos.length, 0);
+  grab.stopWatching();
+});
+
+test('Amazon XHR JSON video lists are observed once and detached correctly', async () => {
+  const f = amazonFixture(), win = f.doc.defaultView, record = amazonRecord(0);
+  let sends = 0;
+  win.XMLHttpRequest = class {
+    constructor() { this.listeners = new Map(); this.responseType = 'json'; this.response = { videos: [record] }; }
+    open(method, url) { this.method = method; this.responseURL = new URL(url, f.doc.URL).href; }
+    addEventListener(name, callback) { this.listeners.set(name, callback); }
+    removeEventListener(name, callback) { if (this.listeners.get(name) === callback) this.listeners.delete(name); }
+    send() { sends++; this.status = 200; this.listeners.get('loadend')?.(); }
+  };
+  const originalOpen = win.XMLHttpRequest.prototype.open, originalSend = win.XMLHttpRequest.prototype.send;
+  const grab = f.run(), request = new win.XMLHttpRequest();
+  request.open('POST', '/gp/video/list'); request.send();
+  await grab.collectReviewVideos();
+  assert.equal(sends, 1);
+  assert.equal(request.response.videos[0], record);
+  assert.equal(grab.videos.length, 1);
+  assert.equal(grab.videos[0].source, 'amazon.xhr.json');
+  grab.stopWatching();
+  assert.equal(win.XMLHttpRequest.prototype.open, originalOpen);
+  assert.equal(win.XMLHttpRequest.prototype.send, originalSend);
+});
+
 test('Amazon image metadata preserves actual original URLs and changing GIFs without rescanning', () => {
   const f = watchFixture({ documentURL: 'https://www.amazon.com/dp/TEST' });
   const original = 'https://m.media-amazon.com/images/I/original.jpg?signature=whole%2Fvalue&expires=999';
@@ -1053,7 +1315,7 @@ test('JSON manifest preserves full ordered addresses and omits excluded events',
   f.doc.body.append(f.img(long, 500), f.img('/first.jpg', 10));
   const manifest = f.run().getManifest();
   assert.equal(manifest.schema, 'media-grab/1');
-  assert.equal(manifest.collectorVersion, '2026.10.15.1');
+  assert.equal(manifest.collectorVersion, '2026.10.15.2');
   assert.equal(manifest.pageUrl, base);
   assert.equal(manifest.title, '상품 테스트');
   assert.ok(Number.isFinite(Date.parse(manifest.exportedAt)));
@@ -1143,8 +1405,8 @@ test('export names manifests after the page hostname and safely handles custom f
 const gifBytes = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
 const pngBytes = Buffer.from('89504e470d0a1a0a00000000', 'hex');
 
-function downloadFixture(routes = {}) {
-  const f = fixture(), blobs = new Map(), saves = [], revoked = [], requests = [];
+function downloadFixture(routes = {}, options = {}) {
+  const f = fixture(options), blobs = new Map(), saves = [], revoked = [], requests = [];
   f.context.Blob = Blob;
   f.context.TextEncoder = TextEncoder;
   f.context.TextDecoder = TextDecoder;
@@ -1216,6 +1478,34 @@ test('browser ZIP preserves page order and GIF bytes and corrects misleading ext
     assert.equal(options.mode, 'cors');
     assert.equal(options.credentials, 'same-origin');
   }
+});
+
+test('console download waits for an already observed Amazon list response before fixing its targets', async () => {
+  const record = amazonRecord(0, { sources: [{ src: 'https://cdn.example/late-original.mp4', type: 'video/mp4' }] });
+  const bytes = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypmp42'),
+    Buffer.alloc(4), Buffer.from('mp42isom'), Buffer.from([0, 0, 0, 8]), Buffer.from('mdat')]);
+  const f = downloadFixture({ [record.sources[0].src]: new Response(bytes) },
+    { documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  let resolveList;
+  const response = new Promise(resolve => { resolveList = resolve; });
+  f.doc.defaultView.fetch = () => response;
+  const grab = f.run(); await grab.ready;
+  const pagePromise = f.doc.defaultView.fetch('/gp/video/list');
+  assert.equal(pagePromise, response);
+  assert.equal(grab.videos.length, 0);
+  const pending = grab.download();
+  resolveList(new Response(JSON.stringify({ videos: [record] }), { headers: { 'Content-Type': 'application/json' } }));
+  const report = await pending;
+  const original = report.results.find(row => row.url === record.sources[0].src);
+  assert.equal(original.status, 'packed');
+  assert.equal(original.thumbnailUrl, record.thumbnailUrl);
+  assert.equal(report.amazonCollection.pendingThumbnails, 0);
+  const files = await zipFiles(f.blobs.get(report.archives[0].url));
+  assert.deepEqual(files.get(original.filename), bytes);
+  const json = JSON.parse(files.get('download-report.json'));
+  assert.equal(json.collectorVersion, '2026.10.15.2');
+  assert.equal(json.amazonCollection.thumbnailsWithOriginal, 1);
+  assert.deepEqual(json.pendingVideos, []);
 });
 
 test('browser ZIP downloads the original Video.js MP4 source instead of its native blob', async () => {
