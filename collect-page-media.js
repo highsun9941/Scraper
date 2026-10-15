@@ -227,13 +227,22 @@
     if (el?.localName !== "script") return;
     const text = el.textContent || "";
     if (!text || scriptTexts.get(el) === text) return;
-    if (text.length > reviewLimit) { reviewLimits.add("review.script"); return; }
+    if (text.length > reviewLimit) {
+      reviewLimits.add("review.script");
+      if (amazonPage(el.ownerDocument)) amazonLimits.add("amazon.script");
+      return;
+    }
     scriptTexts.set(el, text);
     if (/^application\/(?:ld\+)?json$/i.test(el.getAttribute("type") || "") || el.getAttribute("id") === "__NEXT_DATA__") {
       reviewPayload(text, base, "review.script.json", win);
     } else reviewText(text, base, "review.script.url");
+    if (amazonPage(el.ownerDocument)) amazonPayload(text, el.ownerDocument, "amazon.script");
   };
   const captureReviewProps = (el, base, win) => {
+    const collect = (data, source) => {
+      reviewData(data, base, source, win);
+      if (amazonPage(el.ownerDocument)) amazonData(data, el.ownerDocument, source.replace(/^review\./, "amazon."));
+    };
     // 썸네일 주변의 데이터만 검사합니다. React 내부 필드가 없거나 바뀌면 건너뜁니다.
     for (let parent = el, level = 0; parent && level < 8; parent = parentOf(parent), level++) {
       if (reviewPropsVisited.has(parent)) continue;
@@ -248,17 +257,18 @@
       let keys;
       try { keys = Object.getOwnPropertyNames(parent); } catch { continue; }
       for (const key of keys) {
-        if (key.startsWith("__reactProps$")) reviewData(ownValue(parent, key), base, "review.react.props", win);
+        if (key.startsWith("__reactProps$")) collect(ownValue(parent, key), "review.react.props");
         if (!/^(?:__reactFiber\$|__reactInternalInstance\$)/.test(key)) continue;
         for (let fiber = ownValue(parent, key), depth = 0; fiber && typeof fiber === "object" && depth < 12 && !reviewFibersVisited.has(fiber); depth++) {
           reviewFibersVisited.add(fiber);
-          for (const field of ["memoizedProps", "pendingProps", "memoizedState"]) reviewData(ownValue(fiber, field), base, `review.react.${field}`, win);
+          for (const field of ["memoizedProps", "pendingProps", "memoizedState"]) collect(ownValue(fiber, field), "review.react." + field);
           fiber = ownValue(fiber, "return");
         }
       }
     }
   };
   const linkReviewPositions = () => {
+    linkAmazonPositions();
     for (const [key, thumbnail] of reviewPreviews) {
       const preview = found.get(thumbnail);
       if (!preview?.position) continue;
@@ -274,7 +284,8 @@
     try {
       const u = new URL(raw, doc.baseURI), page = new URL(doc.URL || doc.baseURI);
       if (!/^https?:$/.test(u.protocol) || u.origin !== page.origin ||
-          !/(?:^|\/)reviews?(?:\/|$)/i.test(u.pathname) ||
+          !(/(?:^|\/)reviews?(?:\/|$)/i.test(u.pathname) ||
+            amazonPage(doc) && /(?:^|\/)(?:videos?|vse)(?:\/|$)/i.test(u.pathname)) ||
           /(?:^|\/)(?:create|write|save|delete|remove|report|vote|helpful|upload)(?:\/|$)/i.test(u.pathname)) return null;
       u.hash = "";
       return u;
@@ -304,9 +315,11 @@
       await Promise.race([completed, new Promise(resolve => { timer = window.setTimeout(resolve, 8000); })]);
     } finally { window.clearTimeout?.(timer); }
   };
-  const readReviewResponse = async (response, doc, source, epoch) => {
-    if (!watching || epoch !== watchEpoch || !response?.ok) return;
+  const readReviewResponse = async (response, doc, source, epoch, requestUrl = "") => {
+    if (!watching || epoch !== watchEpoch || !response) return;
     if (response.url && !reviewEndpoint(response.url, doc)) return;
+    const responseUrl = response.url || absolute(requestUrl, doc.baseURI) || source;
+    if (!response.ok) { reviewErrors.set(responseUrl, "영상·리뷰 목록 응답 HTTP " + response.status); return; }
     const mime = response.headers?.get("Content-Type") || "";
     if (!/(?:json|text\/(?:plain|html))/i.test(mime)) return;
     if (Number(response.headers?.get("Content-Length")) > reviewLimit) { reviewLimits.add(source); return; }
@@ -334,6 +347,8 @@
     }
     if (watching && epoch === watchEpoch) {
       reviewPayload(text, doc.baseURI, source, doc.defaultView); linkReviewPositions();
+      if (amazonPage(doc)) { amazonPayload(text, doc, source.replace(/^review\./, "amazon.")); linkAmazonPositions(); }
+      reviewErrors.delete(responseUrl);
     }
   };
   const observeReviewResponses = (win, doc) => {
@@ -354,7 +369,7 @@
           if (watching && epoch === watchEpoch && reviewEndpoint(href, doc)) {
             rememberReviewRequest(href, doc, method);
             // 원래 Promise에 바로 연결해야 iframe 등 다른 realm에서도 페이지보다 먼저 clone할 수 있습니다.
-            trackReviewTask(promise.then(response => readReviewResponse(response, doc, "review.fetch", epoch))
+            trackReviewTask(promise.then(response => readReviewResponse(response, doc, "review.fetch", epoch, href))
               .catch(error => reviewErrors.set(href, error.message)));
           }
         } catch {}
@@ -382,12 +397,21 @@
       const remove = () => { xhr.removeEventListener("loadend", loaded); cleanups.delete(remove); };
       const loaded = () => {
         remove();
-        if (!watching || epoch !== watchEpoch || xhr.status < 200 || xhr.status >= 300 ||
+        if (!watching || epoch !== watchEpoch ||
             xhr.responseURL && !reviewEndpoint(xhr.responseURL, doc)) return;
+        if (xhr.status < 200 || xhr.status >= 300) {
+          reviewErrors.set(request.href, "영상·리뷰 목록 응답 HTTP " + xhr.status); return;
+        }
         try {
-          if (xhr.responseType === "json") reviewData(xhr.response, doc.baseURI, "review.xhr.json", win);
-          else if (["", "text"].includes(xhr.responseType || "")) reviewPayload(xhr.responseText, doc.baseURI, "review.xhr", win);
+          if (xhr.responseType === "json") {
+            reviewData(xhr.response, doc.baseURI, "review.xhr.json", win);
+            if (amazonPage(doc)) amazonData(xhr.response, doc, "amazon.xhr.json");
+          } else if (["", "text"].includes(xhr.responseType || "")) {
+            reviewPayload(xhr.responseText, doc.baseURI, "review.xhr", win);
+            if (amazonPage(doc)) amazonPayload(xhr.responseText, doc, "amazon.xhr");
+          }
           linkReviewPositions();
+          reviewErrors.delete(request.href);
         } catch (error) { reviewErrors.set(request.href, error.message); }
       };
       xhr.addEventListener("loadend", loaded, { once: true }); cleanups.add(remove);
@@ -504,6 +528,219 @@
         absolute(source.src, mediaBase) === selected, element);
     }
   };
+  // Amazon의 영상 목록은 카드 속성 외에 초기 JSON·응답·React 데이터에도 남습니다.
+  // 실제 URL만 읽으며 썸네일 이름에서 영상 URL을 만들거나 스크립트를 실행하지 않습니다.
+  const amazonPreviews = new Map(), amazonLimits = new Set(), amazonAttributes = new WeakMap();
+  let amazonDiagnosticBytes = 0;
+  const amazonPage = doc => {
+    try { return /(?:^|\.)amazon\.com$/i.test(new URL(doc?.URL || doc?.baseURI).hostname); } catch { return false; }
+  };
+  const amazonImageKey = (raw, base) => {
+    try {
+      const u = new URL(raw, base);
+      if (!/^https?:$/.test(u.protocol) ||
+          !/^(?:m\.media-amazon\.com|images-na\.ssl-images-amazon\.com)$/.test(u.hostname)) return null;
+      return u.pathname.match(/^\/images\/I\/([^/.]+)\./)?.[1] || null;
+    } catch { return null; }
+  };
+  const amazonPreview = (raw, doc, source, metadata = {}) => {
+    const href = absolute(raw, doc.baseURI), key = amazonImageKey(href, doc.baseURI);
+    if (!key) return null;
+    let preview = amazonPreviews.get(key);
+    if (!preview) {
+      preview = { thumbnailUrl: href, images: new Set(), originals: new Set() };
+      amazonPreviews.set(key, preview);
+    }
+    preview.images.add(href);
+    if (metadata.videoTitle) preview.videoTitle = metadata.videoTitle;
+    if (metadata.cardHtml && !preview.originals.size) {
+      const html = metadata.cardHtml.slice(0, 32768);
+      const next = amazonDiagnosticBytes - (preview.cardHtml?.length || 0) + html.length;
+      if (next <= reviewLimit) {
+        preview.cardHtml = html; preview.htmlTruncated = metadata.cardHtml.length > html.length;
+        amazonDiagnosticBytes = next;
+      } else amazonLimits.add("amazon.cardHtml");
+    }
+    add(href, "IMAGE", doc.baseURI, source);
+    return preview;
+  };
+  const amazonSource = (raw, doc, source, video = false, metadata = {}, thumbnails = []) => {
+    if (typeof raw !== "string" || !/^(?:https?:|\/\/|\/|\.\.?\/)/i.test(raw) && !["VIDEO", "STREAM"].includes(guess(raw))) return;
+    const href = absolute(raw, doc.baseURI);
+    if (!href) return;
+    try {
+      const u = new URL(href), type = guess(href);
+      const known = u.hostname === "m.media-amazon.com" &&
+        /^\/images\/S\/vse-vms-transcoding-artifact[^/]*\//.test(u.pathname) && ["VIDEO", "STREAM"].includes(type);
+      if (!/^https?:$/.test(u.protocol) || ["IMAGE", "GIF"].includes(type) ||
+          /\.(?:ts|m4s|aac|m4a|mp3|vtt|srt)(?:$|[?#])/i.test(href) || !(video || known)) return;
+      add(href, type || "VIDEO", doc.baseURI, source, null, false, Infinity,
+        { provider: "amazon", ...metadata, ...(thumbnails[0] ? { thumbnailUrl: thumbnails[0] } : {}) });
+      for (const thumbnail of thumbnails) {
+        const preview = amazonPreview(thumbnail, doc, source, metadata);
+        if (preview) preview.originals.add(href);
+      }
+    } catch {}
+  };
+  const amazonData = (data, doc, source) => {
+    if (!amazonPage(doc)) return;
+    const seen = new WeakSet(), stack = [{ value: data, depth: 0, video: false, metadata: {}, thumbnails: [] }];
+    const videoKey = /^(?:videos?|(?:related|product|review)videos|video(?:urls?|uris?|src|source|sources|files?|details|data|list)|playback(?:url|urls|source|sources)?|play(?:url|src)|stream(?:url|src|s)?|hls(?:url)?|mp4(?:url)?|sources|renditions)$/i;
+    const imageKey = /^(?:(?:video)?thumbnail(?:urls?)?|thumb(?:url)?|poster(?:url)?|previewimage(?:url)?|image(?:url)?|videoimage(?:url)?)$/i;
+    let count = 0;
+    while (stack.length && count++ < 20000) {
+      const node = stack.pop(), { value, depth } = node;
+      if (depth > 20) { amazonLimits.add(source); continue; }
+      if (typeof value === "string") {
+        if (value.length > reviewLimit) { amazonLimits.add(source); continue; }
+        if (/^\s*[\[{]/.test(value)) {
+          try { stack.push({ ...node, value: JSON.parse(value), depth: depth + 1 }); } catch {}
+        } else if (value.length <= 32768) amazonSource(value, doc, source, node.video, node.metadata, node.thumbnails);
+        continue;
+      }
+      if (!value || typeof value !== "object" || seen.has(value)) continue;
+      seen.add(value);
+      const win = doc.defaultView;
+      if (value === win || value === doc || ownValue(value, "ownerDocument") ||
+          typeof win?.Node === "function" && value instanceof win.Node) continue;
+      let keys;
+      try {
+        keys = Array.isArray(value) ? Array.from({ length: Math.min(value.length, 20000) }, (_, i) => String(i)) :
+          Object.getOwnPropertyNames(value);
+      } catch { continue; }
+      const remaining = Math.max(0, 20000 - count - stack.length);
+      if (keys.length > remaining || Array.isArray(value) && value.length > 20000) amazonLimits.add(source);
+      keys = keys.slice(0, remaining);
+      const fields = new Map(keys.map(key => [key.replace(/[_-]/g, "").toLowerCase(), ownValue(value, key)]));
+      const text = names => names.map(name => fields.get(name)).find(v => typeof v === "string" && v.trim());
+      const id = text(["videoid", "contentid", "id", "asin"]);
+      const videoId = (id?.length || 0) <= 256 && /^amzn1\.(?:vse|ive|productreview)(?:\.|$)/.test(id || "") ? id : "";
+      const title = text(["videotitle", "title", "displaytitle", "name"]);
+      const mime = text(["mimetype", "contenttype", "type"]);
+      const schema = fields.get("@type"), schemaTypes = Array.isArray(schema) ? schema : [schema];
+      if (/^audio(?:\/|$)/i.test(mime || "") || schemaTypes.includes("AudioObject")) continue;
+      const record = node.video || Boolean(videoId) || schemaTypes.includes("VideoObject") ||
+        keys.some(key => /^(?:video(?:urls?|uris?|src|sources?|files?)|playback(?:url|urls|sources?)?|hls(?:url)?|mp4(?:url)?|sources|renditions)$/i.test(key.replace(/[_-]/g, ""))) ||
+        /^(?:video\/|application\/(?:vnd\.apple\.mpegurl|x-mpegurl|dash\+xml))/i.test(mime || "");
+      const video = record || keys.some(key => videoKey.test(key.replace(/[_-]/g, "")));
+      const parentMetadata = videoId && videoId !== node.metadata.videoId ? {} : node.metadata;
+      const metadata = record ? { ...parentMetadata, ...(videoId ? { videoId } : {}),
+        ...(title && !parentMetadata.videoTitle ? { videoTitle: title.trim().slice(0, 1000) } : {}) } : {};
+      const thumbnails = [];
+      if (record) for (const [key, child] of fields) {
+        if (!imageKey.test(key)) continue;
+        const values = typeof child === "string" ? [child] : Array.isArray(child) ? child.slice(0, 32) : [child];
+        for (const item of values) {
+          const raw = typeof item === "string" ? item : ownValue(item, "url") || ownValue(item, "src");
+          if (typeof raw === "string" && amazonPreview(raw, doc, source, metadata)) thumbnails.push(absolute(raw, doc.baseURI));
+        }
+      }
+      const inherited = videoId && videoId !== node.metadata.videoId ? [] : node.thumbnails;
+      for (const key of keys.reverse()) {
+        if (["__proto__", "constructor", "prototype", "_owner", "stateNode", "return", "sibling", "child", "alternate", "ref"].includes(key)) continue;
+        const child = ownValue(value, key), name = key.replace(/[_-]/g, "");
+        if (child === undefined || typeof child === "function" || imageKey.test(name)) continue;
+        stack.push({ value: child, depth: depth + 1,
+          video: video && (Array.isArray(value) || /^(?:url|uri|src|file|files|contenturl)$/i.test(name)) ||
+            node.video && typeof child === "object" || record && /^(?:encodings?|formats?)$/i.test(name) || videoKey.test(name),
+          metadata, thumbnails: thumbnails.length ? thumbnails : inherited });
+      }
+    }
+    if (stack.length) amazonLimits.add(source);
+  };
+  const amazonPayload = (text, doc, source) => {
+    if (!amazonPage(doc) || typeof text !== "string" || !text) return;
+    if (text.length > reviewLimit) { amazonLimits.add(source); return; }
+    try { amazonData(JSON.parse(text), doc, source); return; } catch {}
+    if (!/video|vse|m3u8|mp4/i.test(text)) return;
+    // 따옴표 문자열과 괄호가 짝을 이룬 JSON만 해석합니다. eval/Function은 사용하지 않습니다.
+    let budget = reviewLimit * 2, attempts = 0;
+    const parse = value => {
+      if (!/^\s*[\[{]/.test(value) || !/video|vse|m3u8|mp4/i.test(value)) return;
+      if (++attempts > 128 || (budget -= value.length) < 0) { amazonLimits.add(source); return; }
+      try { amazonData(JSON.parse(value), doc, source); } catch {}
+    };
+    const brackets = [];
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i];
+      if (char === "/" && text[i + 1] === "/") {
+        const end = text.indexOf("\n", i + 2); i = end < 0 ? text.length : end;
+      } else if (char === "/" && text[i + 1] === "*") {
+        const end = text.indexOf("*/", i + 2); i = end < 0 ? text.length : end + 1;
+      } else if (char === '"' || char === "'" || char === "\x60") {
+        let decoded = "", closed = false;
+        for (i++; i < text.length; i++) {
+          const c = text[i];
+          if (c === char) { closed = true; break; }
+          if (c !== "\\") { decoded += c; continue; }
+          const escape = text[++i];
+          if (escape === undefined) break;
+          if (escape === "u" || escape === "x") {
+            const length = escape === "u" ? 4 : 2, hex = text.slice(i + 1, i + 1 + length);
+            if (new RegExp("^[\\da-f]{" + length + "}$", "i").test(hex)) {
+              decoded += String.fromCharCode(parseInt(hex, 16)); i += length;
+            } else decoded += "\\" + escape;
+          } else if (escape === "\r" || escape === "\n") {
+            if (escape === "\r" && text[i + 1] === "\n") i++;
+          } else decoded += ({ n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", v: "\v", "0": "\0" })[escape] ?? escape;
+        }
+        if (closed && !(char === "\x60" && decoded.includes("$" + "{"))) {
+          parse(decoded); if (decoded.length <= 32768) amazonSource(decoded, doc, source);
+        }
+      } else if (char === "{" || char === "[") {
+        if (brackets.length >= 64) { amazonLimits.add(source); return; }
+        brackets.push({ char, start: i });
+      }
+      else if (char === "}" || char === "]") {
+        const open = brackets.pop();
+        if (open && (open.char === "{" ? char === "}" : char === "]")) parse(text.slice(open.start, i + 1));
+      }
+      if (attempts > 128 || budget < 0) break;
+    }
+  };
+  const captureAmazonElement = el => {
+    const doc = el.ownerDocument;
+    if (!amazonPage(doc)) return;
+    for (const attr of ["data-video", "data-video-data", "data-video-info", "data-video-config", "data-props", "data-state", "data-a-state", "data-a-modal", "data-a-popover"]) {
+      const text = el.getAttribute?.(attr);
+      if (!text) continue;
+      let cache = amazonAttributes.get(el);
+      if (!cache) amazonAttributes.set(el, cache = new Map());
+      if (cache.get(attr) === text) continue;
+      cache.set(attr, text); amazonPayload(text, doc, "amazon." + attr);
+    }
+    if (el.localName !== "img" && el.getAttribute?.("data-element-id") !== "video-thumbnail") return;
+    let video = (el.getAttribute("alt") || "").toLowerCase() === "video thumbnail", card = null;
+    for (let node = el, depth = 0; node && depth < 12; node = parentOf(node), depth++) {
+      const role = node.getAttribute?.("data-element-id"), id = node.getAttribute?.("id") || "";
+      if (["video-thumbnail", "video-carousel-item"].includes(role) ||
+          /(?:^|\s)vse-video-(?:card|image)(?:\s|$)/.test(node.getAttribute?.("class") || "") ||
+          ["ivVideoBlock", "ivVideosTab", "vftphero-vse-related-videos"].includes(id)) video = true;
+      if (role === "video-carousel-item" || /(?:^|\s)vse-video-card(?:\s|$)/.test(node.getAttribute?.("class") || "")) {
+        card = node; break;
+      }
+    }
+    if (!video) return;
+    const title = (el.getAttribute("alt") || "").trim(), metadata = title && title.toLowerCase() !== "video thumbnail" ? { videoTitle: title } : {};
+    const html = (card || el.parentElement || el).outerHTML;
+    if (typeof html === "string") metadata.cardHtml = html;
+    for (const raw of [el.currentSrc, el.getAttribute("src"), el.getAttribute("data-src"), el.getAttribute("data-img"), el.getAttribute("data-a-hires")]) {
+      if (raw) amazonPreview(raw, doc, "amazon.thumbnail", metadata);
+    }
+    captureReviewProps(el, el.baseURI || doc.baseURI, doc.defaultView);
+  };
+  const amazonPreviewRow = preview => [...preview.images].map(href => found.get(href)).filter(row => row?.position)
+    .sort((a, b) => Number(b.visible) - Number(a.visible) || comparePosition(a.position, b.position))[0] || found.get(preview.thumbnailUrl);
+  const linkAmazonPositions = () => {
+    for (const preview of amazonPreviews.values()) {
+      const image = amazonPreviewRow(preview);
+      if (!image?.position) continue;
+      for (const href of preview.originals) {
+        const row = found.get(href);
+        if (row && !row.position) { row.position = { ...image.position }; row.element = image.element; }
+      }
+    }
+  };
   const imageDictionaries = new WeakMap();
   const imageOwner = el => el.localName === "source" && el.parentElement?.localName === "picture" ?
     el.parentElement.querySelector("img") : el;
@@ -567,8 +804,15 @@
         if (["ivVideoBlock", "ivVideosTab"].includes(id)) playlists.push("product-videos");
         if (id === "vftphero-vse-related-videos") playlists.push("related-videos");
       }
+      let thumbnailUrl;
+      for (const image of card.querySelectorAll?.("img") || []) {
+        if (image.localName !== "img") continue;
+        const raw = image.currentSrc || image.getAttribute("src") || image.getAttribute("data-src");
+        if (amazonImageKey(raw, doc.baseURI)) { thumbnailUrl = absolute(raw, doc.baseURI); break; }
+      }
       return { provider: "amazon", ...(id ? { videoId: id } : {}),
-        ...(title ? { videoTitle: title } : {}), ...(playlists.length ? { playlists } : {}) };
+        ...(title ? { videoTitle: title } : {}), ...(playlists.length ? { playlists } : {}),
+        ...(thumbnailUrl ? { thumbnailUrl } : {}) };
     } catch { return null; }
   };
   const captureVideoAttributes = (el, position, element) => {
@@ -582,6 +826,10 @@
       else if (/^(?:https?:|blob:|data:|\/|\.{1,2}\/)/i.test(raw) || guess(raw)) {
         add(raw, "VIDEO", base, attr, position, Boolean(metadata) ||
           el.localName === "video" && absolute(raw, base) === primary, element, metadata);
+        const href = absolute(raw, base), row = found.get(href);
+        if (metadata?.thumbnailUrl && row && !row.temporary && ["VIDEO", "STREAM"].includes(row.type)) {
+          amazonPreview(metadata.thumbnailUrl, el.ownerDocument, "amazon.thumbnail", metadata)?.originals.add(href);
+        }
       }
     }
   };
@@ -591,6 +839,7 @@
     const tag = el.localName, base = el.baseURI || el.ownerDocument?.baseURI;
     const win = el.ownerDocument?.defaultView;
     if (!win) return;
+    captureAmazonElement(el);
     const image = isImageElement(el), videoAttributes = ["data-video-src", "data-video-url"].some(a => el.getAttribute(a));
     const previewSources = tag === "img" ? [el.currentSrc, ...["src", "data-src", "data-original"].map(a => el.getAttribute(a))] : [];
     if (!["video", "video-js", "iframe", "object", "embed"].includes(tag) &&
@@ -683,18 +932,20 @@
           if (!watching) return;
           const context = watchedRoots.get(root) || ctx;
           const changed = new Set();
-          for (const record of records) {
-            changed.add(record.target);
+            for (const record of records) {
+              changed.add(record.type === "characterData" ? record.target?.parentElement : record.target);
             for (const node of [...(record.addedNodes || []), ...(record.removedNodes || [])]) {
               changed.add(node);
             }
           }
           for (const node of changed) captureTree(node, context);
         });
-        observer.observe(root, { childList: true, subtree: true, attributes: true,
+        observer.observe(root, { childList: true, subtree: true, attributes: true, characterData: true,
           attributeFilter: ["src", "srcset", "data", "data-src", "data-original", "data-lazy-src", "data-original-src",
             "data-url", "data-large", "data-srcset", "data-lazy-srcset", "data-old-hires", "data-a-dynamic-image",
-            "href", "xlink:href", "poster", "data-video-src", "data-video-url", "data-title", "data-aci-content-id", "data-asin"] });
+            "href", "xlink:href", "poster", "data-video-src", "data-video-url", "data-title", "data-aci-content-id", "data-asin",
+            "data-img", "data-a-hires", "alt", "class", "id", "type", "data-element-id", "data-a-state",
+            "data-video", "data-video-data", "data-video-info", "data-video-config", "data-props", "data-state", "data-a-modal", "data-a-popover"] });
         cleanups.add(() => observer.disconnect());
       }
     } catch {}
@@ -726,6 +977,7 @@
       for (const r of resources) addResource(r, doc.baseURI, doc);
       for (const key of ["__NEXT_DATA__", "__INITIAL_STATE__", "__PRELOADED_STATE__", "__NUXT__"]) {
         reviewData(ownValue(win, key), doc.baseURI, `review.page.${key}`, win);
+        if (amazonPage(doc)) amazonData(ownValue(win, key), doc, "amazon.page." + key);
       }
     }
     for (const el of root.querySelectorAll("*")) {
@@ -822,6 +1074,7 @@
     ...(r.provider ? { provider: r.provider, ...(r.videoId ? { videoId: r.videoId } : {}),
       ...(r.embedUrl ? { embedUrl: r.embedUrl } : {}) } : {}),
     ...(r.videoTitle ? { videoTitle: r.videoTitle } : {}),
+    ...(r.thumbnailUrl ? { thumbnailUrl: r.thumbnailUrl } : {}),
     ...(r.playlists?.length ? { playlists: [...r.playlists] } : {})
   }));
   // 외부 라이브러리 없이 ZIP STORE를 만듭니다. 원본 미디어를 재인코딩하지 않습니다.
@@ -1313,7 +1566,7 @@
   };
   let downloadController = null, downloadReport = null;
   window.mediaGrab = {
-    version: "2026.10.15.1",
+    version: "2026.10.15.2",
     get exportFilename() { return manifestFilename(document.URL || document.location?.href || document.baseURI); },
     get rows() { return ordered(); },
     get urls() { return this.rows.map(r => r.url); },
@@ -1331,7 +1584,24 @@
           const row = found.get(thumbnailUrl);
           return { thumbnailUrl, top: row?.position?.top ?? null, left: row?.position?.left ?? null,
             visible: row?.visible || false, message: "원본 영상 주소 미확인. 페이지·리뷰 응답이 썸네일만 제공하면 재생 없이 추출할 수 없습니다." };
-        });
+        }).concat([...amazonPreviews.values()].filter(preview => ![...preview.originals].some(href => {
+          const row = found.get(href);
+          return row && !row.temporary && ["VIDEO", "STREAM"].includes(row.type);
+        })).map(preview => {
+          const row = amazonPreviewRow(preview);
+          return { provider: "amazon", thumbnailUrl: preview.thumbnailUrl,
+            ...(preview.videoTitle ? { videoTitle: preview.videoTitle } : {}),
+            ...(preview.cardHtml ? { cardHtml: preview.cardHtml, htmlTruncated: preview.htmlTruncated } : {}),
+            top: row?.position?.top ?? null, left: row?.position?.left ?? null, visible: row?.visible || false,
+            message: "이 썸네일과 연결된 원본 영상 주소 미확인. 영상 목록을 열어 페이지 데이터가 로딩되도록 하세요." };
+        }));
+    },
+    get amazonCollection() {
+      const pendingThumbnails = this.pendingVideos.filter(row => row.provider === "amazon").length;
+      return { thumbnailsObserved: amazonPreviews.size, thumbnailsWithOriginal: amazonPreviews.size - pendingThumbnails,
+        pendingThumbnails, pendingResponses: amazonPage(document) ? reviewTasks.size : 0,
+        limitsReached: [...new Set([...amazonLimits, ...(amazonPage(document) ? reviewLimits : [])])],
+        errors: amazonPage(document) ? [...reviewErrors].map(([url, message]) => ({ url, message })) : [] };
     },
     get ready() { return reviewReady; },
     get reviewCollection() {
@@ -1345,9 +1615,10 @@
       await waitReviewTasks();
       linkReviewPositions();
       const result = { videos: this.videos, pendingVideos: this.pendingVideos, ...this.reviewCollection };
-      console.log(`재생 없이 리뷰 데이터 확인: 영상·재생목록·임베드 주소 ${result.videos.length}개 / 원본 미확인 리뷰 ${result.pendingVideos.length}개 / 응답 대기 ${result.pendingResponses}개`);
+      console.log(`재생 없이 영상 데이터 확인: 영상·재생목록·임베드 주소 ${result.videos.length}개 / 원본 미확인 영상 ${result.pendingVideos.length}개 / 응답 대기 ${result.pendingResponses}개`);
       return result;
     },
+    collectVideos(options = {}) { return this.collectReviewVideos(options); },
     get watching() { return watching; },
     watch({ intervalMs = 1000, quiet = true } = {}) {
       if (!Number.isFinite(intervalMs) || intervalMs < 250 || intervalMs > 60000) throw new Error("intervalMs는 250~60000이어야 합니다.");
@@ -1398,6 +1669,10 @@
         maxZipMB = 256, timeoutMs = 30000, credentials = "same-origin", streamsOnly = false, hls = "mp4" } = {}) {
       if (downloadController) throw new Error("이미 다운로드 중입니다. 중단하려면 mediaGrab.stopDownload()를 실행하세요.");
       this.scan({ quiet: true });
+      // 목록 응답이 도착하는 중이면 복제 본문 수집을 기다린 뒤 대상을 확정합니다.
+      await waitReviewTasks();
+      if (downloadController) throw new Error("이미 다운로드 중입니다. 중단하려면 mediaGrab.stopDownload()를 실행하세요.");
+      this.scan({ quiet: true });
       if (![maxFileMB, maxZipMB].every(x => Number.isFinite(x) && x > 0 && x <= 1024) ||
           !Number.isFinite(timeoutMs) || timeoutMs <= 0 || !Number.isInteger(start) || start < 1 ||
           !(end === Infinity || Number.isInteger(end) && end >= start) ||
@@ -1413,13 +1688,15 @@
       const zipLimit = Math.floor(maxZipMB * 1024 ** 2), stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "");
       const pageUrl = document.URL || document.baseURI;
       downloadReport = { schema: "media-grab-download/1", pageUrl, startedAt: new Date().toISOString(),
-        finishedAt: null, results: [], archives: [], cancelled: false };
+        finishedAt: null, results: [], archives: [], cancelled: false,
+        collectorVersion: this.version, pendingVideos: this.pendingVideos, amazonCollection: this.amazonCollection };
       let entries = [], partResults = [], partBytes = 0;
       const flush = () => {
         if (!partResults.length) return;
         const index = downloadReport.archives.length + 1, filename = `page-media-${stamp}-${String(index).padStart(3, "0")}.zip`;
         const blob = makeZip([...entries,
-          textEntry("download-report.json", JSON.stringify({ pageUrl, results: partResults }, null, 2)),
+          textEntry("download-report.json", JSON.stringify({ pageUrl, collectorVersion: downloadReport.collectorVersion,
+            pendingVideos: downloadReport.pendingVideos, amazonCollection: downloadReport.amazonCollection, results: partResults }, null, 2)),
           textEntry("download-report.csv", reportCSV(partResults)),
           textEntry("failed.csv", reportCSV(partResults.filter(row => ["failed", "skipped"].includes(row.status))))]);
         const archive = { index, filename, bytes: blob.size, url: URL.createObjectURL(blob), downloadRequested: false };
@@ -1474,7 +1751,7 @@
         const playlists = downloadReport.results.filter(row => row.status === "playlist").length;
         const links = downloadReport.results.filter(row => row.status === "link").length;
         console.log(`완료: 미디어 ${packed}개 / 재생목록 ${playlists}개 / 외부 영상 링크 ${links}개 / 실패·건너뜀 ${rows.length - packed - playlists - links}개 / ZIP ${downloadReport.archives.length}개`);
-        if (this.pendingVideos.length) console.log(`아직 썸네일만 확인된 리뷰 영상 ${this.pendingVideos.length}개: mediaGrab.pendingVideos`);
+        if (this.pendingVideos.length) console.log(`아직 원본과 연결되지 않은 영상 썸네일 ${this.pendingVideos.length}개: mediaGrab.pendingVideos (보고서 JSON에도 포함)`);
         console.log("상세 결과: mediaGrab.lastDownload. ZIP 안의 failed.csv에서 실패 주소를 확인하세요.");
         return downloadReport;
       } finally { downloadController = null; }
@@ -1491,6 +1768,7 @@
         items: visibleOnly ? this.visibleRows : this.rows,
         blockedFrames: this.blockedFrames,
         pendingVideos: this.pendingVideos,
+        amazonCollection: this.amazonCollection,
         reviewCollection: this.reviewCollection
       };
     },
@@ -1535,8 +1813,9 @@
       console.log("선택: 주소 목록 JSON 저장: mediaGrab.export(). 다운로드 결과와 실패 원인은 mediaGrab.lastDownload에서 확인하세요.");
       if (excluded.size) console.log(`미디어에서 제외한 통계·이벤트 주소 ${excluded.size}개: mediaGrab.excludedRows`);
       if (blockedFrames.size) console.log("접근할 수 없는 iframe:", this.blockedFrames);
-      console.log(`외부 영상 링크 ${this.embeds.length}개 / 영상·재생목록 주소 ${this.videos.length - this.embeds.length}개 (MP4·HLS·DASH 등, 같은 영상의 여러 주소 포함 가능) / 미확인 리뷰 영상 ${this.pendingVideos.length}개`);
-      if (this.pendingVideos.length) console.log("미확인 리뷰 영상: mediaGrab.pendingVideos. await mediaGrab.collectReviewVideos()로 리뷰 데이터를 확인하세요.");
+      console.log(`외부 영상 링크 ${this.embeds.length}개 / 영상·재생목록 주소 ${this.videos.length - this.embeds.length}개 (MP4·HLS·DASH 등, 같은 영상의 여러 주소 포함 가능) / 원본 미확인 영상 ${this.pendingVideos.length}개`);
+      if (amazonPage(document)) console.log("Amazon 썸네일과 원본 연결 현황: mediaGrab.amazonCollection");
+      if (this.pendingVideos.length) console.log("미확인 영상: mediaGrab.pendingVideos. 영상 목록을 로딩한 뒤 await mediaGrab.collectVideos()로 다시 확인하세요.");
       return rows;
     }
   };
