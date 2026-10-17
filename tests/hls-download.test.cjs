@@ -30,6 +30,12 @@ function runtime(base, resources, fetcher = fetch) {
   const doc = { URL: base, baseURI: base, defaultView: window, title: 'HLS fixture',
     querySelectorAll: () => [], body: { appendChild() {} },
     createElement: () => ({ style: {}, click() {}, remove() {} }) };
+  // A supplied blob represents a current native video, not an expired Timing entry.
+  const nativeVideos = resources.filter(name => String(name).startsWith('blob:')).map(src => ({
+    localName: 'video', currentSrc: src, ownerDocument: doc, baseURI: base,
+    getAttribute: name => name === 'src' ? src : null, querySelectorAll: () => []
+  }));
+  doc.querySelectorAll = () => nativeVideos;
   const urls = class extends URL {
     static createObjectURL(blob) { archives.push(blob); return 'blob:archive-' + archives.length; }
     static revokeObjectURL() {}
@@ -385,3 +391,4 @@ test('HLS metadata size and nested playlist limits stop before requesting more c
   assert.equal(server.requests.filter(path => path.startsWith('/depth')).length, 5);
   assert.deepEqual(mediaFiles(await unzip(archives[0])), []);
 });
+
