@@ -85,6 +85,54 @@ function fixture({ scrollX = 0, scrollY = 0, resources = [], documentURL = base,
 const urls = grab => Array.from(grab.urls);
 const visible = grab => Array.from(grab.visibleUrls);
 
+test('Amazon impression endpoints are excluded without discarding displayed advertising images', () => {
+  const tracking = 'https://aax-us-east-retail-direct.amazon.com/e/is/ABC0123/impb?w=0&bi=tracking';
+  const image = 'https://aax-us-east-retail-direct.amazon.com/images/displayed.gif';
+  const f = fixture({ resources: [{ name: tracking, initiatorType: 'img' }, { name: image, initiatorType: 'img' }] });
+  const grab = f.run();
+  assert.deepEqual(urls(grab), [image]);
+  assert.equal(grab.excludedRows[0].url, tracking);
+});
+
+test('unreferenced historical MediaSource entries do not become downloadable videos', () => {
+  const f = fixture({ resources: [{ name: 'blob:https://shop.example/expired-player', initiatorType: 'video' }] });
+  const current = 'blob:https://shop.example/current-player';
+  f.doc.body.append(f.element('video', { currentSrc: current }));
+  assert.deepEqual(urls(f.run()), [current]);
+});
+
+test('visible inline SVGs retain vector markup, pixel dimensions and namespaces without event handlers', () => {
+  const f = fixture(), svg = f.element('svg', { attrs: { viewBox: '0 0 24 24', onclick: 'unsafe()' } });
+  svg.cloneNode = () => {
+    const attrs = { ...svg.attrs };
+    return { localName: 'svg', attrs, querySelectorAll: () => [],
+      get attributes() { return Object.keys(attrs).map(name => ({ name })); },
+      setAttribute(name, value) { attrs[name] = value; }, removeAttribute(name) { delete attrs[name]; } };
+  };
+  f.context.XMLSerializer = class {
+    serializeToString(node) { return '<svg ' + Object.entries(node.attrs).map(([key, value]) => key + '="' + value + '"').join(' ') + '></svg>'; }
+  };
+  f.doc.body.append(svg);
+  const grab = f.run(), row = grab.rows.find(row => row.source === 'svg.inline');
+  assert.ok(row); assert.equal(row.type, 'IMAGE');
+  const xml = decodeURIComponent(row.url.slice(row.url.indexOf(',') + 1));
+  assert.match(xml, /xmlns="http:\/\/www.w3.org\/2000\/svg"/);
+  assert.match(xml, /width="80"/); assert.match(xml, /height="80"/);
+  assert.ok(!xml.includes('onclick'));
+  assert.equal(grab.audit().inlineMediaDiagnostics.length, 0);
+});
+
+test('inline SVGs with unresolved references remain explicit coverage diagnostics', () => {
+  const f = fixture(), svg = f.element('svg'), use = f.element('use', { attrs: { href: '#outside-symbol' } });
+  svg.append(use); svg.cloneNode = () => assert.fail('unresolved SVG must not be exported as complete');
+  f.context.XMLSerializer = class {};
+  f.doc.body.append(svg);
+  const grab = f.run(), audit = grab.audit();
+  assert.equal(audit.inlineMediaDiagnostics.length, 1);
+  assert.match(audit.inlineMediaDiagnostics[0].message, /SVG 외부 참조/);
+  assert.ok(!grab.rows.some(row => row.source === 'svg.inline'));
+});
+
 function watchFixture(options = {}) {
   const f = fixture(options), mutations = [], resources = [], listeners = new Map(), intervals = new Map();
   const win = f.doc.defaultView;
@@ -1315,7 +1363,7 @@ test('JSON manifest preserves full ordered addresses and omits excluded events',
   f.doc.body.append(f.img(long, 500), f.img('/first.jpg', 10));
   const manifest = f.run().getManifest();
   assert.equal(manifest.schema, 'media-grab/1');
-  assert.equal(manifest.collectorVersion, '2026.10.15.2');
+  assert.equal(manifest.collectorVersion, '2026.10.17.1');
   assert.equal(manifest.pageUrl, base);
   assert.equal(manifest.title, '상품 테스트');
   assert.ok(Number.isFinite(Date.parse(manifest.exportedAt)));
@@ -1405,6 +1453,182 @@ test('export names manifests after the page hostname and safely handles custom f
 const gifBytes = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
 const pngBytes = Buffer.from('89504e470d0a1a0a00000000', 'hex');
 
+test('Amazon creator avatars remain images and do not become unresolved video thumbnails', () => {
+  const f = fixture({ documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  const thumbnail = 'https://m.media-amazon.com/images/I/real-thumbnail.jpg';
+  const avatar = 'https://m.media-amazon.com/images/I/creator-avatar.jpg';
+  const card = f.element('div', { attrs: { 'data-element-id': 'video-carousel-item',
+    'data-video-url': 'https://cdn.example/actual.mp4', 'data-title': 'Actual video' } });
+  const profile = f.element('div', { attrs: { class: 'a-profile-avatar' } });
+  profile.append(f.img(avatar, 50));
+  card.append(f.img(thumbnail, 20, 0, { attrs: { alt: 'video thumbnail' } }), profile);
+  f.doc.body.append(card);
+  const grab = f.run();
+  assert.equal(grab.amazonCollection.thumbnailsObserved, 1);
+  assert.equal(grab.pendingVideos.length, 0);
+  assert.ok(urls(grab).includes(avatar));
+});
+
+test('Amazon image state collects provided high resolution URLs for the selected color only', () => {
+  const f = fixture({ documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  const image = name => 'https://m.media-amazon.com/images/I/' + name + '.jpg';
+  const record = name => ({ variant: 'PT01', hiRes: image(name + '-hires'),
+    thumb: image(name + '-thumb'), main: { [image(name + '-selected')]: [679, 679] } });
+  const state = f.element('script', { attrs: { type: 'application/json' } });
+  state.textContent = JSON.stringify({ landingAsinColor: 'Black', colorImages: { Black: [record('black')], Red: [record('red')] } });
+  const initial = f.element('script');
+  initial.textContent = "A.$.parseJSON('" + JSON.stringify([record('current')]) + "');";
+  f.context.A = { $: { parseJSON() { assert.fail('page code must never be executed to read image state'); } } };
+  f.doc.body.append(state, initial);
+  const grab = f.run();
+  for (const name of ['black-hires', 'black-thumb', 'black-selected', 'current-hires']) assert.ok(urls(grab).includes(image(name)));
+  assert.ok(!urls(grab).some(href => href.includes('/red-')));
+  assert.equal(grab.videos.length, 0);
+});
+
+test('an advertised Amazon video count exposes unopened gallery cards even with zero pending thumbnails', () => {
+  const f = fixture({ documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  const label = f.element('div', { attrs: { id: 'altImages' } }); label.textContent = '10 VIDEOS';
+  const card = f.element('div', { attrs: { 'data-element-id': 'video-carousel-item',
+    'data-video-url': 'https://cdn.example/first.mp4' } });
+  f.doc.body.append(label, card);
+  const grab = f.run(), audit = grab.audit();
+  assert.equal(grab.pendingVideos.length, 0);
+  assert.equal(audit.expectedAmazonVideos, 10);
+  assert.equal(audit.observedAmazonVideoCards, 1);
+  assert.equal(audit.missingAmazonVideoCards, 9);
+  assert.equal(audit.completeForObservedUrls, false);
+});
+
+test('related video cards cannot hide missing cards from the product gallery count', () => {
+  const f = fixture({ documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  const label = f.element('div', { attrs: { id: 'altImages' } }); label.textContent = '10 VIDEOS';
+  const card = id => f.element('div', { attrs: { 'data-element-id': 'video-carousel-item',
+    'data-video-url': 'https://cdn.example/video-' + id + '.mp4' } });
+  const related = f.element('div', { attrs: { id: 'vftphero-vse-related-videos' } });
+  for (let i = 1; i <= 9; i++) related.append(card(i));
+  f.doc.body.append(label, card(0), related);
+  const grab = f.run(), audit = grab.audit();
+  assert.equal(audit.observedAmazonVideoCards, 10);
+  assert.equal(audit.observedAmazonProductVideoCards, 1);
+  assert.equal(audit.observedAmazonRelatedVideoCards, 9);
+  assert.equal(audit.missingAmazonVideoCards, 9);
+});
+
+test('page preparation loads delayed images, stops at the document end and restores the scroll position', async () => {
+  const f = fixture({ scrollX: 5, scrollY: 90 }), win = f.doc.defaultView;
+  f.doc.documentElement.scrollHeight = 1600; win.innerHeight = 400;
+  win.setTimeout = fn => { queueMicrotask(fn); return 0; };
+  let loaded = false;
+  win.scrollTo = position => {
+    win.scrollX = position.left; win.scrollY = position.top;
+    if (!loaded && position.top >= 800) { loaded = true; f.doc.body.append(f.img('/late-original.gif', 1000)); }
+  };
+  const grab = f.run();
+  const report = await grab.prepare({ gallery: false, maxScrolls: 10, settleMs: 20 });
+  assert.ok(urls(grab).includes(url('/late-original.gif')));
+  assert.ok(report.scrollSteps >= 5 && report.scrollSteps < 10);
+  assert.deepEqual(Array.from(report.limitsReached), []);
+  assert.equal(win.scrollX, 5); assert.equal(win.scrollY, 90);
+});
+
+test('Amazon preparation opens the known gallery, collects all cards, pauses new autoplay and restores the dialog', async () => {
+  const f = watchFixture({ documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  f.doc.defaultView.setTimeout = fn => { queueMicrotask(fn); return 0; };
+  const label = f.element('div', { attrs: { id: 'altImages' } }); label.textContent = '2 VIDEOS';
+  const opener = f.element('a'); opener.textContent = 'Click to see full view';
+  let open = false, loaded = false, paused = 0;
+  const video = f.element('video'); video.muted = false; video.pause = () => paused++;
+  const modal = { getBoundingClientRect: () => ({ height: open ? 400 : 0 }),
+    querySelector: () => ({ click() { open = false; } }) };
+  const panel = { closest: () => modal };
+  opener.click = () => { open = true; };
+  const tab = { click() {
+    if (loaded) return; loaded = true;
+    for (let i = 0; i < 2; i++) f.doc.body.append(f.element('div', { attrs: {
+      'data-element-id': 'video-carousel-item', 'data-video-url': 'https://cdn.example/video-' + i + '.mp4' } }));
+    f.doc.body.append(video); f.listeners.get('play')({ target: video });
+  } };
+  f.doc.querySelector = selector => selector === '#ivVideosTab' ? panel :
+    selector === '#ivVideosTabHeading a' ? (open ? tab : null) :
+    selector.includes('[data-element-id=') ? (loaded ? {} : null) : null;
+  f.doc.body.append(label, opener);
+  const grab = f.run(), report = await grab.prepare({ scroll: false, settleMs: 20 });
+  assert.equal(report.galleryOpened, true);
+  assert.equal(grab.amazonCollection.galleryVideosObserved, 2);
+  assert.equal(grab.amazonCollection.missingVideoCards, 0);
+  assert.equal(open, false); assert.equal(paused, 1); assert.equal(video.muted, false);
+  grab.stopWatching();
+});
+
+test('the download audit retains real missing visible media and the ZIP preview uses only escaped local filenames', async () => {
+  const failed = url('/unreadable.jpg');
+  const f = downloadFixture({ [failed]: new TypeError('CORS blocked') });
+  f.doc.body.append(f.img('/saved.gif', 0), f.img(failed, 100));
+  const grab = f.run(), report = await grab.download({ prepare: false });
+  assert.equal(report.audit.completeForObservedUrls, false);
+  assert.equal(report.audit.missingVisibleUrls.length, 1);
+  assert.equal(report.audit.missingVisibleUrls[0].url, failed);
+  const files = await zipFiles(f.blobs.get(report.archives[0].url));
+  const audit = JSON.parse(files.get('page-audit.json'));
+  assert.equal(audit.finished, true);
+  assert.equal(audit.missingUrls.length, 1);
+  const preview = files.get('preview.html').toString();
+  assert.match(preview, /src="0001.gif"/);
+  assert.ok(!preview.includes('src="' + failed));
+  assert.deepEqual(files.get('0001.gif'), gifBytes);
+});
+
+test('a known original from the same Video.js player covers its MediaSource without a blob fetch', async () => {
+  const source = url('/same-player.mp4'), blob = 'blob:https://shop.example/player';
+  const bytes = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypmp42'),
+    Buffer.alloc(4), Buffer.from('mp42isom'), Buffer.from([0, 0, 0, 8]), Buffer.from('mdat')]);
+  const f = downloadFixture({ [source]: () => new Response(bytes), [blob]: () => assert.fail('MediaSource is not a file') });
+  const wrapper = f.element('div', { attrs: { class: 'video-js' } });
+  wrapper.player = { currentSource: () => ({ src: source, type: 'video/mp4' }) };
+  wrapper.append(f.element('video', { attrs: { src: blob } })); f.doc.body.append(wrapper);
+  const report = await f.run().download({ prepare: false });
+  assert.ok(report.results.every(row => ['packed', 'covered'].includes(row.status)));
+  assert.ok(!f.requests.some(request => request.href === blob));
+  assert.equal(report.audit.missingUrls.length, 0);
+});
+
+test('media inserted while downloading is reported as not attempted rather than a complete page', async () => {
+  let f;
+  f = downloadFixture({ [url('/first.gif')]: () => {
+    f.doc.body.append(f.img('/arrived-during-download.gif', 200));
+    return new Response(gifBytes);
+  } });
+  f.doc.body.append(f.img('/first.gif', 0));
+  const report = await f.run().download({ prepare: false });
+  assert.equal(report.results.length, 1);
+  assert.equal(report.audit.expectedUrls, 2);
+  assert.equal(report.audit.completeForObservedUrls, false);
+  assert.equal(report.audit.missingUrls[0].status, 'not-attempted');
+  assert.equal(report.audit.missingUrls[0].url, url('/arrived-during-download.gif'));
+  const files = await zipFiles(f.blobs.get(report.archives[0].url));
+  assert.equal(JSON.parse(files.get('page-audit.json')).expectedUrls, 2);
+});
+
+test('download previews escape page supplied video titles and retain inaccessible frame diagnostics', async () => {
+  const source = 'https://cdn.example/original.mp4';
+  const title = 'x"><img src=x onerror=alert(1)> & title';
+  const bytes = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypmp42'),
+    Buffer.alloc(4), Buffer.from('mp42isom'), Buffer.from([0, 0, 0, 8]), Buffer.from('mdat')]);
+  const f = downloadFixture({ [source]: new Response(bytes) },
+    { documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  f.doc.body.append(f.element('div', { attrs: { 'data-element-id': 'video-carousel-item',
+    'data-title': title, 'data-video-url': source } }),
+    f.element('iframe', { attrs: { src: 'https://external.example/frame' } }));
+  const report = await f.run().download({ prepare: false });
+  assert.deepEqual(Array.from(report.audit.blockedFrames), ['https://external.example/frame']);
+  const files = await zipFiles(f.blobs.get(report.archives[0].url));
+  const preview = files.get('preview.html').toString();
+  assert.ok(!preview.includes(title));
+  assert.match(preview, /&lt;img src=x onerror=alert\(1\)&gt; &amp; title/);
+  assert.ok(!preview.includes('<script'));
+});
+
 function downloadFixture(routes = {}, options = {}) {
   const f = fixture(options), blobs = new Map(), saves = [], revoked = [], requests = [];
   f.context.Blob = Blob;
@@ -1471,7 +1695,7 @@ test('browser ZIP preserves page order and GIF bytes and corrects misleading ext
   assert.equal(result.archives.length, 1);
   assert.equal(f.saves.length, 1);
   const files = await zipFiles(f.blobs.get(result.archives[0].url));
-  assert.deepEqual([...files.keys()], ['0001.png', '0002.gif', 'download-report.json', 'download-report.csv', 'failed.csv']);
+  assert.deepEqual([...files.keys()], ['0001.png', '0002.gif', 'download-report.json', 'download-report.csv', 'failed.csv', 'page-audit.json', 'preview.html']);
   assert.deepEqual(files.get('0002.gif'), gifBytes);
   assert.deepEqual(files.get('0001.png'), pngBytes);
   for (const { options } of f.requests) {
@@ -1503,7 +1727,7 @@ test('console download waits for an already observed Amazon list response before
   const files = await zipFiles(f.blobs.get(report.archives[0].url));
   assert.deepEqual(files.get(original.filename), bytes);
   const json = JSON.parse(files.get('download-report.json'));
-  assert.equal(json.collectorVersion, '2026.10.15.2');
+  assert.equal(json.collectorVersion, '2026.10.17.1');
   assert.equal(json.amazonCollection.thumbnailsWithOriginal, 1);
   assert.deepEqual(json.pendingVideos, []);
 });
@@ -1648,3 +1872,4 @@ test('explicit playlist option stores stream playlists without claiming a comple
   assert.equal(result.results[0].filename, '0001.m3u8');
   assert.match(result.results[0].message, /영상 조각/);
 });
+
