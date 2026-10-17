@@ -546,6 +546,7 @@
   // 실제 URL만 읽으며 썸네일 이름에서 영상 URL을 만들거나 스크립트를 실행하지 않습니다.
   const amazonPreviews = new Map(), amazonLimits = new Set(), amazonAttributes = new WeakMap();
   const amazonGalleryVideos = new Map();
+  const amazonProductVideoCards = new Set(), amazonRelatedVideoCards = new Set();
   let amazonExpectedVideos = 0;
   let amazonDiagnosticBytes = 0;
   const amazonPage = doc => {
@@ -737,7 +738,12 @@
     if (el.getAttribute?.("data-element-id") === "video-carousel-item") {
       const href = absolute(el.getAttribute("data-video-url") || el.getAttribute("data-video-src"), doc.baseURI);
       const id = el.getAttribute("data-aci-content-id") || el.getAttribute("data-csa-c-item-id") || href;
-      if (id && href) amazonGalleryVideos.set(id, href);
+      if (id && href) {
+        amazonGalleryVideos.set(id, href);
+        const lists = amazonVideoMetadata(el)?.playlists || [];
+        if (lists.includes("related-videos") && !lists.includes("product-videos")) amazonRelatedVideoCards.add(id);
+        else amazonProductVideoCards.add(id);
+      }
     }
     if (el.getAttribute?.("id") === "altImages") {
       const match = (el.textContent || "").match(/(?:^|\s)([0-9]+)\s+VIDEOS?\b/i);
@@ -877,12 +883,59 @@
       }
     }
   };
+  const inlineDiagnostics = new Map();
+  const captureInlineSvg = (el, position, element) => {
+    if (!position || typeof XMLSerializer !== "function" || !el.cloneNode) return;
+    for (let parent = parentOf(el); parent; parent = parentOf(parent)) if (parent.localName === "svg") return;
+    try {
+      const originals = [el, ...el.querySelectorAll("*")], ids = new Set(originals.map(node => node.getAttribute("id")).filter(Boolean));
+      if (originals.some(node => ["script", "foreignObject", "animate", "animateTransform", "animateMotion"].includes(node.localName))) {
+        throw new Error("스크립트·HTML·애니메이션이 있는 SVG는 정적 원본으로 검증할 수 없습니다.");
+      }
+      for (const node of originals) {
+        const href = node.getAttribute("href") || node.getAttribute("xlink:href");
+        if (href && (!href.startsWith("#") || !ids.has(href.slice(1)))) throw new Error("SVG 외부 참조를 로컬 파일로 보존할 수 없습니다.");
+      }
+      const clone = el.cloneNode(true), copies = [clone, ...clone.querySelectorAll("*")];
+      const rect = el.getBoundingClientRect();
+      clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+      clone.setAttribute("width", String(Math.max(1, Math.round(rect.width))));
+      clone.setAttribute("height", String(Math.max(1, Math.round(rect.height))));
+      const properties = ["fill", "stroke", "stroke-width", "fill-opacity", "stroke-opacity", "opacity",
+        "display", "visibility", "fill-rule", "clip-rule", "color", "font-family", "font-size", "font-weight",
+        "stop-color", "stop-opacity", "filter", "mask", "clip-path", "transform", "vector-effect"];
+      for (let i = 0; i < copies.length; i++) {
+        if (copies[i].localName === "style") { copies[i].remove(); continue; }
+        for (const attribute of [...(copies[i].attributes || [])]) {
+          if (/^on/i.test(attribute.name) || attribute.name === "style") copies[i].removeAttribute(attribute.name);
+        }
+        const style = styleOf(originals[i]);
+        for (const name of properties) {
+          let value = style?.getPropertyValue(name);
+          if (!value) continue;
+          value = value.replace(/url\(\s*["']?([^"')]+)["']?\s*\)/g, (match, raw) => {
+            const target = new URL(raw, el.baseURI), page = new URL(el.ownerDocument.URL || el.baseURI);
+            if (target.origin !== page.origin || target.pathname !== page.pathname || target.search !== page.search ||
+                !ids.has(target.hash.slice(1))) throw new Error("SVG 외부 색상·마스크 참조를 보존할 수 없습니다.");
+            return "url(#" + target.hash.slice(1) + ")";
+          });
+          copies[i].setAttribute(name, value);
+        }
+      }
+      const xml = new XMLSerializer().serializeToString(clone);
+      if (xml.length > 262144) throw new Error("인라인 SVG 크기 제한을 넘었습니다.");
+      add("data:image/svg+xml;charset=utf-8," + encodeURIComponent(xml), "IMAGE", el.baseURI,
+        "svg.inline", position, true, element);
+      inlineDiagnostics.delete(el);
+    } catch (error) { inlineDiagnostics.set(el, { type: "SVG", label: el.getAttribute("aria-label") || el.id || "inline SVG", message: error.message }); }
+  };
   // 동적 이미지·영상 카드와 팝업은 제거되기 전에 읽습니다. 재생하거나 src를 변경하지 않습니다.
   const captureMedia = (el, ctx, element = Infinity) => {
     if (!el?.localName) return;
     const tag = el.localName, base = el.baseURI || el.ownerDocument?.baseURI;
     const win = el.ownerDocument?.defaultView;
     if (!win) return;
+    if (tag === "svg") captureInlineSvg(el, locate(el, ctx), element);
     captureAmazonElement(el);
     const image = isImageElement(el), videoAttributes = ["data-video-src", "data-video-url"].some(a => el.getAttribute(a));
     const previewSources = tag === "img" ? [el.currentSrc, ...["src", "data-src", "data-original"].map(a => el.getAttribute(a))] : [];
@@ -1238,16 +1291,21 @@
     });
     const missingVideoCards = Math.max(0, (amazon.expectedVideos || 0) - (amazon.galleryVideosObserved || 0));
     const limits = [...new Set([...(amazon.limitsReached || []), ...(preparation?.limitsReached || [])])];
+    const inlineMedia = [...inlineDiagnostics.values()];
     return { scope: "loaded-page-urls", finished: Boolean(finished), expectedUrls: rows.length,
       blockedFrames: [...frames],
+      inlineMediaDiagnostics: inlineMedia,
       packedUrls: results.filter(row => row.status === "packed").length,
       coveredTemporaryUrls: results.filter(row => row.status === "covered").length,
       visibleUrls: rows.filter(row => row.visible).length, missingUrls: missing,
       missingVisibleUrls: missing.filter(row => row.visible), pendingVideoThumbnails: pendingVideos.length,
-      expectedAmazonVideos: amazon.expectedVideos || 0, observedAmazonVideoCards: amazon.galleryVideosObserved || 0,
+      expectedAmazonVideos: amazon.expectedVideos || 0,
+      observedAmazonVideoCards: amazon.videoCardsObserved ?? amazon.galleryVideosObserved ?? 0,
+      observedAmazonProductVideoCards: amazon.galleryVideosObserved || 0,
+      observedAmazonRelatedVideoCards: amazon.relatedVideoCardsObserved || 0,
       missingAmazonVideoCards: missingVideoCards, limitsReached: limits,
       completeForObservedUrls: Boolean(finished) && !missing.length && !pendingVideos.length &&
-        !missingVideoCards && !limits.length && !(preparation?.warnings?.length),
+        !missingVideoCards && !limits.length && !inlineMedia.length && !(preparation?.warnings?.length),
       note: "현재 로딩되어 관찰한 주소를 대조합니다. 열지 않은 목록·접근 불가 iframe·DRM·CORS 제한까지 완전 수집했다는 뜻은 아닙니다." };
   };
   const previewHTML = rows => {
@@ -1671,6 +1729,7 @@
     get excludedRows() { return [...excluded.values()].map(r => ({ ...r })); },
     get excludedUrls() { return [...excluded.keys()]; },
     get blockedFrames() { return [...blockedFrames]; },
+    get inlineMediaDiagnostics() { return [...inlineDiagnostics.values()]; },
     get embeds() { return this.rows.filter(r => r.type === "EMBED"); },
     get videos() { return this.rows.filter(r => ["VIDEO", "STREAM", "EMBED"].includes(r.type) && !r.temporary); },
     get pendingVideos() {
@@ -1696,8 +1755,9 @@
       const pendingThumbnails = this.pendingVideos.filter(row => row.provider === "amazon").length;
       return { thumbnailsObserved: amazonPreviews.size, thumbnailsWithOriginal: amazonPreviews.size - pendingThumbnails,
         pendingThumbnails, pendingResponses: amazonPage(document) ? reviewTasks.size : 0,
-        expectedVideos: amazonExpectedVideos, galleryVideosObserved: amazonGalleryVideos.size,
-        missingVideoCards: Math.max(0, amazonExpectedVideos - amazonGalleryVideos.size),
+        expectedVideos: amazonExpectedVideos, galleryVideosObserved: amazonProductVideoCards.size,
+        videoCardsObserved: amazonGalleryVideos.size, relatedVideoCardsObserved: amazonRelatedVideoCards.size,
+        missingVideoCards: Math.max(0, amazonExpectedVideos - amazonProductVideoCards.size),
         limitsReached: [...new Set([...amazonLimits, ...(amazonPage(document) ? reviewLimits : [])])],
         errors: amazonPage(document) ? [...reviewErrors].map(([url, message]) => ({ url, message })) : [] };
     },
@@ -1725,6 +1785,7 @@
       if (preparationRun) return preparationRun;
       const run = (async () => {
         const report = { scrollSteps: 0, galleryOpened: false, warnings: [], limitsReached: [] };
+        lastPreparation = report;
         const win = document.defaultView || window, origin = { x: Number(win.scrollX) || 0, y: Number(win.scrollY) || 0 };
         const query = selector => document.querySelector?.(selector);
         const wait = ms => new Promise(resolve => (win.setTimeout || setTimeout)(resolve, ms));
@@ -1770,8 +1831,8 @@
                 stable = size === last ? stable + 1 : 0; last = size;
               }
             }
-            if (amazonExpectedVideos > amazonGalleryVideos.size) report.warnings.push(
-              "Amazon 표시 영상 " + amazonExpectedVideos + "개 중 카드 " + amazonGalleryVideos.size + "개만 로딩됨");
+            if (amazonExpectedVideos > amazonProductVideoCards.size) report.warnings.push(
+              "Amazon 표시 영상 " + amazonExpectedVideos + "개 중 상품 카드 " + amazonProductVideoCards.size + "개만 로딩됨");
           }
         } catch (error) { report.warnings.push("갤러리 준비: " + error.message); }
         finally {
@@ -1994,6 +2055,8 @@
         items: visibleOnly ? this.visibleRows : this.rows,
         blockedFrames: this.blockedFrames,
         pendingVideos: this.pendingVideos,
+        inlineMediaDiagnostics: this.inlineMediaDiagnostics,
+        preparation: lastPreparation,
         amazonCollection: this.amazonCollection,
         reviewCollection: this.reviewCollection
       };
@@ -2041,8 +2104,8 @@
       if (blockedFrames.size) console.log("접근할 수 없는 iframe:", this.blockedFrames);
       console.log(`외부 영상 링크 ${this.embeds.length}개 / 영상·재생목록 주소 ${this.videos.length - this.embeds.length}개 (MP4·HLS·DASH 등, 같은 영상의 여러 주소 포함 가능) / 원본 미확인 영상 ${this.pendingVideos.length}개`);
       if (amazonPage(document)) console.log("Amazon 썸네일과 원본 연결 현황: mediaGrab.amazonCollection");
-      if (amazonExpectedVideos > amazonGalleryVideos.size) console.log("페이지에 표시된 영상 " +
-        amazonExpectedVideos + "개 중 카드 " + amazonGalleryVideos.size +
+      if (amazonExpectedVideos > amazonProductVideoCards.size) console.log("페이지에 표시된 영상 " +
+        amazonExpectedVideos + "개 중 상품 카드 " + amazonProductVideoCards.size +
         "개만 확인했습니다. await mediaGrab.prepare()로 갤러리를 로딩하세요.");
       if (this.pendingVideos.length) console.log("미확인 영상: mediaGrab.pendingVideos. 영상 목록을 로딩한 뒤 await mediaGrab.collectVideos()로 다시 확인하세요.");
       return rows;

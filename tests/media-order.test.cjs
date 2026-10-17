@@ -101,6 +101,38 @@ test('unreferenced historical MediaSource entries do not become downloadable vid
   assert.deepEqual(urls(f.run()), [current]);
 });
 
+test('visible inline SVGs retain vector markup, pixel dimensions and namespaces without event handlers', () => {
+  const f = fixture(), svg = f.element('svg', { attrs: { viewBox: '0 0 24 24', onclick: 'unsafe()' } });
+  svg.cloneNode = () => {
+    const attrs = { ...svg.attrs };
+    return { localName: 'svg', attrs, querySelectorAll: () => [],
+      get attributes() { return Object.keys(attrs).map(name => ({ name })); },
+      setAttribute(name, value) { attrs[name] = value; }, removeAttribute(name) { delete attrs[name]; } };
+  };
+  f.context.XMLSerializer = class {
+    serializeToString(node) { return '<svg ' + Object.entries(node.attrs).map(([key, value]) => key + '="' + value + '"').join(' ') + '></svg>'; }
+  };
+  f.doc.body.append(svg);
+  const grab = f.run(), row = grab.rows.find(row => row.source === 'svg.inline');
+  assert.ok(row); assert.equal(row.type, 'IMAGE');
+  const xml = decodeURIComponent(row.url.slice(row.url.indexOf(',') + 1));
+  assert.match(xml, /xmlns="http:\/\/www.w3.org\/2000\/svg"/);
+  assert.match(xml, /width="80"/); assert.match(xml, /height="80"/);
+  assert.ok(!xml.includes('onclick'));
+  assert.equal(grab.audit().inlineMediaDiagnostics.length, 0);
+});
+
+test('inline SVGs with unresolved references remain explicit coverage diagnostics', () => {
+  const f = fixture(), svg = f.element('svg'), use = f.element('use', { attrs: { href: '#outside-symbol' } });
+  svg.append(use); svg.cloneNode = () => assert.fail('unresolved SVG must not be exported as complete');
+  f.context.XMLSerializer = class {};
+  f.doc.body.append(svg);
+  const grab = f.run(), audit = grab.audit();
+  assert.equal(audit.inlineMediaDiagnostics.length, 1);
+  assert.match(audit.inlineMediaDiagnostics[0].message, /SVG 외부 참조/);
+  assert.ok(!grab.rows.some(row => row.source === 'svg.inline'));
+});
+
 function watchFixture(options = {}) {
   const f = fixture(options), mutations = [], resources = [], listeners = new Map(), intervals = new Map();
   const win = f.doc.defaultView;
@@ -1466,6 +1498,21 @@ test('an advertised Amazon video count exposes unopened gallery cards even with 
   assert.equal(audit.observedAmazonVideoCards, 1);
   assert.equal(audit.missingAmazonVideoCards, 9);
   assert.equal(audit.completeForObservedUrls, false);
+});
+
+test('related video cards cannot hide missing cards from the product gallery count', () => {
+  const f = fixture({ documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  const label = f.element('div', { attrs: { id: 'altImages' } }); label.textContent = '10 VIDEOS';
+  const card = id => f.element('div', { attrs: { 'data-element-id': 'video-carousel-item',
+    'data-video-url': 'https://cdn.example/video-' + id + '.mp4' } });
+  const related = f.element('div', { attrs: { id: 'vftphero-vse-related-videos' } });
+  for (let i = 1; i <= 9; i++) related.append(card(i));
+  f.doc.body.append(label, card(0), related);
+  const grab = f.run(), audit = grab.audit();
+  assert.equal(audit.observedAmazonVideoCards, 10);
+  assert.equal(audit.observedAmazonProductVideoCards, 1);
+  assert.equal(audit.observedAmazonRelatedVideoCards, 9);
+  assert.equal(audit.missingAmazonVideoCards, 9);
 });
 
 test('page preparation loads delayed images, stops at the document end and restores the scroll position', async () => {

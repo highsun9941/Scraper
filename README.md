@@ -66,6 +66,9 @@ Amazon 갤러리의 고해상도 이미지는 페이지가 제공한 `hiRes`·`m
 같은 Video.js 재생 요소에서 원본이 확인된 MediaSource 주소는 그 원본으로 저장하거나 이미 저장된 원본을 `covered`로 연결합니다.
 과거 Resource Timing에만 남은 blob 주소는 새 파일 후보로 만들지 않으며, 현재 DOM의 연결되지 않은 blob은 여전히 실제 읽기 실패로 보고합니다.
 
+표시된 인라인 정적 SVG도 벡터 파일로 저장하며 계산된 색상·선과 픽셀 크기를 보존합니다. 스크립트·애니메이션·외부 심볼 참조 등으로 정적 원본을 검증할 수 없는 SVG는 `inlineMediaDiagnostics`에 남깁니다.
+상품 갤러리의 영상 수를 관련 영상 수와 별도로 대조하므로, 관련 카드가 상품 갤러리의 누락을 가리지 않습니다.
+
 ## 선택: 윈도우에서 JSON 목록 → CMD로 다운로드하기
 
 1. **Python 3.10 이상**을 설치합니다. [공식 Windows 다운로드](https://www.python.org/downloads/windows/)에서 받을 수 있습니다.
