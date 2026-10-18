@@ -1307,8 +1307,10 @@
   };
   const reportCSV = rows => {
     const fields = ["fileOrder", "order", "x", "y", "visible", "status", "filename", "bytes", "httpStatus", "contentType", "url", "duplicateOf", "dedupeReason", "message"];
+    const orderedRows = [...rows].sort((a, b) => (a.fileOrder || Infinity) - (b.fileOrder || Infinity) ||
+      Number(["duplicate", "covered"].includes(a.status)) - Number(["duplicate", "covered"].includes(b.status)) || a.order - b.order);
     const quote = value => `"${String(value ?? "").replace(/"/g, '""')}"`;
-    return "\ufeff" + [fields, ...rows.map(row => fields.map(field => row[field]))]
+    return "\ufeff" + [fields, ...orderedRows.map(row => fields.map(field => row[field]))]
       .map(row => row.map(quote).join(",")).join("\r\n") + "\r\n";
   };
   const auditRows = (rows, results, amazon, pendingVideos, finished, preparation, frames = [], collection = {}) => {
