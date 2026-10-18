@@ -805,7 +805,7 @@
     const emit = (raw, source) => add(raw, kind, base, source, position,
       absolute(raw, base) === primary, element);
     emit(el.currentSrc, `${tag}.currentSrc`);
-    for (const attr of ["src", "data-src", "data-original", "data-lazy-src", "data-original-src", "data-url", "data-large", "data-old-hires"]) {
+    for (const attr of ["src", "data-src", "data-original", "data-lazy-src", "data-original-src", "data-url", "data-large", "data-old-hires", "data-a-hires", "data-hires", "data-img"]) {
       emit(el.getAttribute(attr), `${tag}.${attr}`);
     }
     for (const attr of ["srcset", "data-srcset", "data-lazy-srcset"]) {
@@ -1041,7 +1041,7 @@
           attributeFilter: ["src", "srcset", "data", "data-src", "data-original", "data-lazy-src", "data-original-src",
             "data-url", "data-large", "data-srcset", "data-lazy-srcset", "data-old-hires", "data-a-dynamic-image",
             "href", "xlink:href", "poster", "data-video-src", "data-video-url", "data-title", "data-aci-content-id", "data-asin",
-            "data-img", "data-a-hires", "alt", "class", "id", "type", "data-element-id", "data-a-state",
+            "data-img", "data-a-hires", "data-hires", "alt", "class", "id", "type", "data-element-id", "data-a-state",
             "data-video", "data-video-data", "data-video-info", "data-video-config", "data-props", "data-state", "data-a-modal", "data-a-popover"] });
         cleanups.add(() => observer.disconnect());
       }
@@ -1274,7 +1274,7 @@
     return "\ufeff" + [fields, ...rows.map(row => fields.map(field => row[field]))]
       .map(row => row.map(quote).join(",")).join("\r\n") + "\r\n";
   };
-  const auditRows = (rows, results, amazon, pendingVideos, finished, preparation, frames = []) => {
+  const auditRows = (rows, results, amazon, pendingVideos, finished, preparation, frames = [], collection = {}) => {
     const saved = new Map();
     for (const row of results) if (row.status === "packed") {
       saved.set(row.url, row);
@@ -1290,11 +1290,18 @@
         message: result?.message || "이번 다운로드 대상에 포함되지 않은 주소입니다." };
     });
     const missingVideoCards = Math.max(0, (amazon.expectedVideos || 0) - (amazon.galleryVideosObserved || 0));
-    const limits = [...new Set([...(amazon.limitsReached || []), ...(preparation?.limitsReached || [])])];
+    const limits = [...new Set([...(amazon.limitsReached || []), ...(collection.limitsReached || []), ...(preparation?.limitsReached || [])])];
     const inlineMedia = [...inlineDiagnostics.values()];
+    const pendingResponses = Math.max(amazon.pendingResponses || 0, collection.pendingResponses || 0);
+    const collectionErrors = [...new Map([...(amazon.errors || []), ...(collection.errors || [])]
+      .map(error => [error.url + "\n" + error.message, { ...error }])).values()];
+    const ready = Boolean(finished) && !pendingResponses && !collection.refreshing && !collectionErrors.length &&
+      !missingVideoCards && !limits.length && !inlineMedia.length && !(preparation?.warnings?.length);
+    const completeForObservedUrls = ready && !missing.length && !pendingVideos.length;
     return { scope: "loaded-page-urls", finished: Boolean(finished), expectedUrls: rows.length,
       blockedFrames: [...frames],
       inlineMediaDiagnostics: inlineMedia,
+      pendingResponses, collectionErrors,
       packedUrls: results.filter(row => row.status === "packed").length,
       coveredTemporaryUrls: results.filter(row => row.status === "covered").length,
       visibleUrls: rows.filter(row => row.visible).length, missingUrls: missing,
@@ -1304,8 +1311,9 @@
       observedAmazonProductVideoCards: amazon.galleryVideosObserved || 0,
       observedAmazonRelatedVideoCards: amazon.relatedVideoCardsObserved || 0,
       missingAmazonVideoCards: missingVideoCards, limitsReached: limits,
-      completeForObservedUrls: Boolean(finished) && !missing.length && !pendingVideos.length &&
-        !missingVideoCards && !limits.length && !inlineMedia.length && !(preparation?.warnings?.length),
+      completeForObservedUrls,
+      completeForVisibleUrls: ready && !missing.some(row => row.visible) && !pendingVideos.some(row => row.visible),
+      completeForLoadedPage: completeForObservedUrls && !frames.length,
       note: "현재 로딩되어 관찰한 주소를 대조합니다. 열지 않은 목록·접근 불가 iframe·DRM·CORS 제한까지 완전 수집했다는 뜻은 아닙니다." };
   };
   const previewHTML = rows => {
@@ -1720,7 +1728,7 @@
   };
   let downloadController = null, downloadReport = null, preparationRun = null, lastPreparation = null;
   window.mediaGrab = {
-    version: "2026.10.17.1",
+    version: "2026.10.18.1",
     get exportFilename() { return manifestFilename(document.URL || document.location?.href || document.baseURI); },
     get rows() { return ordered(); },
     get urls() { return this.rows.map(r => r.url); },
@@ -1823,7 +1831,9 @@
             const tab = query("#ivVideosTabHeading a");
             if (tab) {
               tab.click();
-              await until(() => query('#ivVideosTab [data-element-id="video-carousel-item"]'));
+              if (!await until(() => query('#ivVideosTab [data-element-id="video-carousel-item"]'))) {
+                report.warnings.push("Amazon 영상 카드 로딩 시간 초과");
+              }
               let last = -1, stable = 0;
               for (let i = 0; i < 20 && stable < 3; i++) {
                 await wait(settleMs); this.scan({ quiet: true });
@@ -1871,8 +1881,8 @@
     },
     audit() {
       this.scan({ quiet: true });
-      return { ...auditRows(this.rows, downloadReport?.results || [], this.amazonCollection,
-        this.pendingVideos, Boolean(downloadReport?.finishedAt), lastPreparation), blockedFrames: this.blockedFrames };
+      return auditRows(this.rows, downloadReport?.results || [], this.amazonCollection,
+        this.pendingVideos, Boolean(downloadReport?.finishedAt), lastPreparation, this.blockedFrames, this.reviewCollection);
     },
     get watching() { return watching; },
     watch({ intervalMs = 1000, quiet = true } = {}) {
@@ -1947,29 +1957,39 @@
       const pageUrl = document.URL || document.baseURI;
       downloadReport = { schema: "media-grab-download/1", pageUrl, startedAt: new Date().toISOString(),
         finishedAt: null, results: [], archives: [], cancelled: false,
-        preparation: prepare ? lastPreparation : null,
+        preparation: lastPreparation,
         blockedFrames: this.blockedFrames,
-        collectorVersion: this.version, pendingVideos: this.pendingVideos, amazonCollection: this.amazonCollection };
+        collectorVersion: this.version, pendingVideos: this.pendingVideos, amazonCollection: this.amazonCollection,
+        reviewCollection: this.reviewCollection };
       let entries = [], partResults = [], partBytes = 0;
+      const parts = [];
       const flush = () => {
         if (!partResults.length) return;
-        const index = downloadReport.archives.length + 1, filename = `page-media-${stamp}-${String(index).padStart(3, "0")}.zip`;
-        const blob = makeZip([...entries,
+        // 앞쪽 ZIP에도 최종 대조 결과를 넣도록 모든 주소의 처리가 끝난 뒤 저장합니다.
+        parts.push({ entries, results: partResults });
+        entries = []; partResults = []; partBytes = 0;
+      };
+      const saveParts = () => {
+        for (const [part, contents] of parts.entries()) {
+          const index = part + 1, filename = `page-media-${stamp}-${String(index).padStart(3, "0")}.zip`;
+          const session = { startedAt: downloadReport.startedAt, finishedAt: downloadReport.finishedAt,
+            cancelled: downloadReport.cancelled, totalResults: downloadReport.results.length,
+            part: index, totalParts: parts.length };
+          const blob = makeZip([...contents.entries,
           textEntry("download-report.json", JSON.stringify({ pageUrl, collectorVersion: downloadReport.collectorVersion,
             pendingVideos: downloadReport.pendingVideos, amazonCollection: downloadReport.amazonCollection,
-            preparation: downloadReport.preparation, results: partResults }, null, 2)),
-          textEntry("download-report.csv", reportCSV(partResults)),
-          textEntry("failed.csv", reportCSV(partResults.filter(row => ["failed", "skipped"].includes(row.status)))),
-          textEntry("page-audit.json", JSON.stringify(auditRows(observedRows, downloadReport.results,
-            downloadReport.amazonCollection, downloadReport.pendingVideos, Boolean(downloadReport.finishedAt),
-            downloadReport.preparation, downloadReport.blockedFrames), null, 2)),
-          textEntry("preview.html", previewHTML(partResults))]);
-        const archive = { index, filename, bytes: blob.size, url: URL.createObjectURL(blob), downloadRequested: false };
-        downloadReport.archives.push(archive);
-        try { requestSave(archive.url, filename); archive.downloadRequested = true; }
-        catch (error) { archive.message = error.message; }
-        console.log(`ZIP ${index} 저장 요청: ${filename}. 시작되지 않으면 mediaGrab.saveArchive(${index})`);
-        entries = []; partResults = []; partBytes = 0;
+            reviewCollection: downloadReport.reviewCollection, preparation: downloadReport.preparation,
+            session, audit: downloadReport.audit, results: contents.results }, null, 2)),
+          textEntry("download-report.csv", reportCSV(contents.results)),
+          textEntry("failed.csv", reportCSV(contents.results.filter(row => ["failed", "skipped"].includes(row.status)))),
+          textEntry("page-audit.json", JSON.stringify(downloadReport.audit, null, 2)),
+          textEntry("preview.html", previewHTML(contents.results))]);
+          const archive = { index, filename, bytes: blob.size, url: URL.createObjectURL(blob), downloadRequested: false };
+          downloadReport.archives.push(archive);
+          try { requestSave(archive.url, filename); archive.downloadRequested = true; }
+          catch (error) { archive.message = error.message; }
+          console.log(`ZIP ${index} 저장 요청: ${filename}. 시작되지 않으면 mediaGrab.saveArchive(${index})`);
+        }
       };
       console.log(`브라우저에서 ${rows.length}개 주소를 읽어 ZIP으로 저장합니다. 중단: mediaGrab.stopDownload()`);
       try {
@@ -2027,10 +2047,13 @@
         this.scan({ quiet: true }); observedRows = this.rows;
         downloadReport.blockedFrames = this.blockedFrames;
         downloadReport.amazonCollection = this.amazonCollection;
+        downloadReport.reviewCollection = this.reviewCollection;
         downloadReport.pendingVideos = this.pendingVideos;
         downloadReport.audit = auditRows(observedRows, downloadReport.results, downloadReport.amazonCollection,
-          downloadReport.pendingVideos, true, downloadReport.preparation, downloadReport.blockedFrames);
+          downloadReport.pendingVideos, true, downloadReport.preparation, downloadReport.blockedFrames,
+          downloadReport.reviewCollection);
         flush();
+        saveParts();
         const packed = downloadReport.results.filter(row => row.status === "packed").length;
         const playlists = downloadReport.results.filter(row => row.status === "playlist").length;
         const links = downloadReport.results.filter(row => row.status === "link").length;
@@ -2113,4 +2136,5 @@
   };
   window.mediaGrab.watch({ quiet: false });
 })();
+
 
