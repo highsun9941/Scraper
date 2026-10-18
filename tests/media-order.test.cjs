@@ -1363,7 +1363,7 @@ test('JSON manifest preserves full ordered addresses and omits excluded events',
   f.doc.body.append(f.img(long, 500), f.img('/first.jpg', 10));
   const manifest = f.run().getManifest();
   assert.equal(manifest.schema, 'media-grab/1');
-  assert.equal(manifest.collectorVersion, '2026.10.17.1');
+  assert.equal(manifest.collectorVersion, '2026.10.18.1');
   assert.equal(manifest.pageUrl, base);
   assert.equal(manifest.title, '상품 테스트');
   assert.ok(Number.isFinite(Date.parse(manifest.exportedAt)));
@@ -1561,6 +1561,24 @@ test('Amazon preparation opens the known gallery, collects all cards, pauses new
   grab.stopWatching();
 });
 
+test('an empty Amazon video tab reports a loading timeout even without an advertised video count', async () => {
+  const f = fixture({ documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  f.doc.defaultView.setTimeout = callback => { queueMicrotask(callback); return 0; };
+  let open = false;
+  const opener = f.element('a'); opener.textContent = 'Click to see full view';
+  opener.click = () => { open = true; };
+  const tab = { click() {} }, modal = {
+    getBoundingClientRect: () => ({ height: open ? 400 : 0 }),
+    querySelector: () => ({ click() { open = false; } })
+  };
+  f.doc.querySelector = selector => selector === '#ivVideosTab' ? { closest: () => modal } :
+    selector === '#ivVideosTabHeading a' && open ? tab : null;
+  f.doc.body.append(opener);
+  const grab = f.run(), report = await grab.prepare({ scroll: false, settleMs: 20 });
+  assert.ok(report.warnings.some(message => /영상 카드 로딩 시간 초과/.test(message)));
+  assert.equal(open, false);
+});
+
 test('the download audit retains real missing visible media and the ZIP preview uses only escaped local filenames', async () => {
   const failed = url('/unreadable.jpg');
   const f = downloadFixture({ [failed]: new TypeError('CORS blocked') });
@@ -1727,7 +1745,7 @@ test('console download waits for an already observed Amazon list response before
   const files = await zipFiles(f.blobs.get(report.archives[0].url));
   assert.deepEqual(files.get(original.filename), bytes);
   const json = JSON.parse(files.get('download-report.json'));
-  assert.equal(json.collectorVersion, '2026.10.17.1');
+  assert.equal(json.collectorVersion, '2026.10.18.1');
   assert.equal(json.amazonCollection.thumbnailsWithOriginal, 1);
   assert.deepEqual(json.pendingVideos, []);
 });
@@ -1826,6 +1844,100 @@ test('browser ZIP splits large batches into independent archives and can retry a
   assert.equal(grab.lastDownload, null);
 });
 
+test('all split ZIPs contain the same final audit, with global totals and local file reports', async () => {
+  const f = downloadFixture();
+  f.doc.body.append(f.img('/first.gif', 0), f.img('/second.gif', 100));
+  const report = await f.run().download({ prepare: false, maxZipMB: gifBytes.length / 1024 ** 2 });
+  assert.equal(report.archives.length, 2);
+  for (const [index, archive] of report.archives.entries()) {
+    const files = await zipFiles(f.blobs.get(archive.url));
+    const audit = JSON.parse(files.get('page-audit.json'));
+    const local = JSON.parse(files.get('download-report.json'));
+    assert.deepEqual(audit, JSON.parse(JSON.stringify(report.audit)));
+    assert.equal(audit.finished, true);
+    assert.equal(audit.completeForObservedUrls, true);
+    assert.equal(audit.missingUrls.length, 0);
+    assert.equal(local.session.totalResults, 2);
+    assert.equal(local.session.totalParts, 2);
+    assert.equal(local.session.part, index + 1);
+    assert.equal(local.session.finishedAt, report.finishedAt);
+    assert.equal(local.results.length, 1);
+    assert.ok(files.has(local.results[0].filename));
+    assert.deepEqual(local.audit, audit);
+  }
+});
+
+test('failed hidden resources stay failures while visible coverage and blocked-frame scope remain distinct', async () => {
+  const hidden = url('/hidden.jpg'), f = downloadFixture({ [hidden]: new TypeError('CORS blocked') });
+  f.doc.body.append(f.img('/visible.gif', 0), f.img(hidden, 100, 0, { styles: { display: 'none' } }),
+    f.element('iframe', { attrs: { src: 'https://external.example/frame' } }));
+  const grab = f.run(), report = await grab.download({ prepare: false });
+  assert.equal(report.results.find(row => row.url === hidden).status, 'failed');
+  assert.equal(report.audit.completeForObservedUrls, false);
+  assert.equal(report.audit.completeForVisibleUrls, true);
+  assert.equal(report.audit.completeForLoadedPage, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(grab.audit())), JSON.parse(JSON.stringify(report.audit)));
+  assert.equal(grab.audit().blockedFrames.length, 1);
+});
+
+test('an inaccessible frame prevents loaded-page completeness even when every observed URL was saved', async () => {
+  const f = downloadFixture();
+  f.doc.body.append(f.img('/visible.gif', 0), f.element('iframe', { attrs: { src: 'https://external.example/frame' } }));
+  const grab = f.run(), report = await grab.download({ prepare: false });
+  assert.equal(report.audit.completeForObservedUrls, true);
+  assert.equal(report.audit.completeForLoadedPage, false);
+  assert.equal(grab.audit().completeForLoadedPage, false);
+});
+
+test('unreadable video-list metadata prevents a successful completeness audit despite successful media reads', async () => {
+  const f = downloadFixture({}, { documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  f.doc.defaultView.fetch = async () => new Response('unavailable', { status: 503 });
+  f.doc.body.append(f.img('/visible.gif', 0));
+  const grab = f.run(); await grab.ready;
+  await f.doc.defaultView.fetch('/gp/video/list');
+  await grab.collectVideos({ refresh: false });
+  const report = await grab.download({ prepare: false });
+  assert.equal(report.results[0].status, 'packed');
+  assert.equal(report.audit.missingUrls.length, 0);
+  assert.equal(report.audit.collectionErrors.length, 1);
+  assert.match(report.audit.collectionErrors[0].message, /503/);
+  assert.equal(report.audit.completeForObservedUrls, false);
+  assert.equal(report.audit.completeForVisibleUrls, false);
+});
+
+test('unfinished observed metadata responses remain pending in the final download audit', async () => {
+  const f = downloadFixture({}, { documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  f.doc.defaultView.fetch = () => new Promise(() => {});
+  f.doc.defaultView.setTimeout = callback => { queueMicrotask(callback); return 1; };
+  f.doc.defaultView.clearTimeout = () => {};
+  f.doc.body.append(f.img('/visible.gif', 0));
+  const grab = f.run(); await grab.ready;
+  f.doc.defaultView.fetch('/gp/video/list');
+  const report = await grab.download({ prepare: false });
+  assert.equal(report.results[0].status, 'packed');
+  assert.equal(report.audit.pendingResponses, 1);
+  assert.equal(report.audit.completeForObservedUrls, false);
+  grab.stopWatching();
+});
+
+test('high-resolution and deferred image attributes are collected and their later mutations remain observable', () => {
+  const f = watchFixture();
+  const image = f.img('/selected.jpg', 100, 0, { attrs: {
+    'data-a-hires': '/hires.jpg', 'data-hires': '/hires-alternative.jpg', 'data-img': '/deferred.gif'
+  } });
+  f.doc.body.append(image);
+  const grab = f.run();
+  for (const name of ['/selected.jpg', '/hires.jpg', '/hires-alternative.jpg', '/deferred.gif']) {
+    assert.ok(urls(grab).includes(url(name)), name);
+  }
+  assert.deepEqual(visible(grab), [url('/selected.jpg')]);
+  assert.ok(f.mutations[0].options.attributeFilter.includes('data-hires'));
+  image.attrs['data-hires'] = '/new-hires.gif';
+  f.mutations[0].callback([{ type: 'attributes', target: image, attributeName: 'data-hires' }]);
+  assert.ok(urls(grab).includes(url('/new-hires.gif')));
+  grab.stopWatching();
+});
+
 test('browser ZIP bounds downloads even without Content-Length and leaves oversized files in failed report', async () => {
   const f = downloadFixture({
     [url('/stream.gif')]: new Response(gifBytes),
@@ -1872,4 +1984,5 @@ test('explicit playlist option stores stream playlists without claiming a comple
   assert.equal(result.results[0].filename, '0001.m3u8');
   assert.match(result.results[0].message, /영상 조각/);
 });
+
 

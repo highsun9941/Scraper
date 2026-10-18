@@ -30,7 +30,7 @@ ZIP 안의 보고서에서 저장 결과를 확인합니다. 읽지 못한 원�
 
 ## 다운로드 결과를 페이지와 대조하기
 
-최신 버전은 **2026.10.17.1**입니다. 기본 `await mediaGrab.download()`는 먼저 지연 이미지와 Amazon 영상 갤러리의 로딩을 준비합니다.
+최신 버전은 **2026.10.18.1**입니다. 기본 `await mediaGrab.download()`는 먼저 지연 이미지와 Amazon 영상 갤러리의 로딩을 준비합니다.
 상품 옵션·장바구니·리뷰 페이지는 변경하지 않습니다. 준비 과정에서 새로 자동 재생되는 영상은 일시 정지하며, 원래 열려 있던 갤러리 탭과 페이지 스크롤 위치를 복원합니다.
 끝없이 늘어나는 문서는 최대 80단계에서 중단하고 한도 도달을 보고합니다.
 
@@ -59,9 +59,18 @@ ZIP을 **압축 해제한 다음 `preview.html`을 열면** 저장된 이미지�
 `completeForObservedUrls`는 **관찰한 모든 주소가 실제 파일로 저장되었는지**를 뜻합니다.
 아직 열지 않은 목록, 다른 상품 옵션, 접근할 수 없는 iframe, DRM 영상, CORS로 본문을 읽을 수 없는 파일까지 수집했다는 의미는 아닙니다.
 링크·재생목록만 저장한 경우도 영상 파일을 저장한 것으로 판정하지 않습니다. 부분 범위 다운로드에서는 범위 밖 관찰 주소를 `not-attempted`로 남깁니다.
-분할 ZIP의 앞쪽 `page-audit.json`은 중간 상태이며, 마지막 ZIP 및 `mediaGrab.lastDownload.audit`에서 최종 전체 상태를 확인하세요.
+모든 주소의 처리가 끝난 뒤 분할 ZIP을 저장하므로, **각 ZIP의 `page-audit.json`에 동일한 최종 전체 감사 결과**가 들어 있습니다. `download-report.json`의 `results`와 CSV는 해당 ZIP의 항목만 담고, `session`은 전체 처리 개수·완료 시각·분할 번호를 제공합니다. 저장 요청이 발행됐다는 기록은 운영체제에 파일 저장이 완료됐다는 확인과 구분해야 합니다.
 
-Amazon 갤러리의 고해상도 이미지는 페이지가 제공한 `hiRes`·`main` 사전에서 읽으며, 다른 색상의 이미지나 존재를 확인하지 않은 CDN 경로를 만들지 않습니다.
+| 감사 필드 | 의미 |
+|---|---|
+| `completeForVisibleUrls` | 현재 관찰한 표시 URL에 저장 누락이 없고, 알려진 영상 카드·메타데이터 대기·수집 오류·준비 경고가 없는지 |
+| `completeForObservedUrls` | 숨겨진 과거 주소를 포함해 관찰한 모든 URL이 저장됐는지 |
+| `completeForLoadedPage` | 위 조건과 함께 접근 불가 iframe도 없는지 |
+| `pendingResponses` · `collectionErrors` | 아직 끝나지 않았거나 실패한 영상·리뷰 목록 응답 |
+
+표시 URL의 완전성만 참이어도 숨겨진 주소의 실제 실패는 `missingUrls`와 `failed.csv`에 그대로 남습니다. 접근 불가 iframe 내부나 아직 열지 않은 콘텐츠의 완전성을 보장하지 않습니다.
+
+Amazon 갤러리의 고해상도 이미지는 페이지가 제공한 `hiRes`·`main` 사전과 `data-a-hires`·`data-hires`·`data-img` 속성에서도 읽으며, 다른 색상의 이미지나 존재를 확인하지 않은 CDN 경로를 만들지 않습니다.
 영상 카드의 작성자 프로필 사진은 일반 이미지로 저장하고 미확인 영상 썸네일 수에 더하지 않습니다.
 같은 Video.js 재생 요소에서 원본이 확인된 MediaSource 주소는 그 원본으로 저장하거나 이미 저장된 원본을 `covered`로 연결합니다.
 과거 Resource Timing에만 남은 blob 주소는 새 파일 후보로 만들지 않으며, 현재 DOM의 연결되지 않은 blob은 여전히 실제 읽기 실패로 보고합니다.
@@ -97,7 +106,7 @@ Amazon 갤러리의 고해상도 이미지는 페이지가 제공한 `hiRes`·`m
 
 최신 파일을 내려받아도 이미 페이지에서 실행 중인 `mediaGrab`이나 저장해 둔 이전 스니펫은 자동으로 바뀌지 않습니다.
 **최신 `collect-page-media.js` 전체를 다시 붙여 넣어 실행**하고, 스니펫을 사용한다면 저장된 코드도 전체 교체합니다.
-현재 버전은 Console에서 `mediaGrab.version`으로 확인할 수 있으며, 이 버전의 값은 **`2026.10.17.1`**입니다.
+현재 버전은 Console에서 `mediaGrab.version`으로 확인할 수 있으며, 이 버전의 값은 **`2026.10.18.1`**입니다.
 
 ## 사이트 이름으로 목록 파일 내보내기
 
@@ -120,7 +129,7 @@ mediaGrab.export({ filename: 'my-media.json' })
 
 ## Amazon 상품 페이지의 이미지·영상 목록 수집하기
 
-1. 최신 `collect-page-media.js` 전체를 상품 페이지 콘솔에서 먼저 실행하고 `mediaGrab.version`이 `2026.10.17.1`인지 확인합니다.
+1. 최신 `collect-page-media.js` 전체를 상품 페이지 콘솔에서 먼저 실행하고 `mediaGrab.version`이 `2026.10.18.1`인지 확인합니다.
 2. 상품의 메인 이미지·상세내용·갤러리와 관련 영상 목록을 **직접 열고 스크롤해 로딩**합니다. 기본 download()는 상품 갤러리를 로딩하고 페이지를 스크롤합니다. 임의의 목록 다음 페이지나 상품 옵션을 클릭하지는 않습니다.
 3. 영상 카드에 `data-video-url`·`data-video-src` 등으로 원본 주소가 제공되면 **재생하지 않아도** 수집합니다. 초기 JSON·a-state·JSON-LD·인라인 JSON과 JSON.parse 문자열·주변 React 데이터에서도 실제 영상 URL을 확인합니다. 실행 후 자동 감시가 발견한 주소는 팝업을 닫아도 보존합니다.
 4. 필요한 목록을 모두 열어 본 뒤 `await mediaGrab.ready`, `mediaGrab.scan()`, `await mediaGrab.download()` 순서로 콘솔에서 수집·다운로드합니다.
@@ -756,4 +765,5 @@ HTTP 오류나 직접 접근 제한은 URL 수집·정렬 코드를 바꾸는 �
 이 프로젝트의 자체 코드와 문서는 [MIT License](LICENSE)로 제공합니다.
 `collect-page-media.js`에 포함된 mux.js는 기존 **Apache License 2.0**을 따릅니다.
 해당 라이선스 전문과 저작권·출처 정보는 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)에 보존합니다.
+
 
