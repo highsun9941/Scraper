@@ -1306,7 +1306,7 @@
     return `${name}.json`;
   };
   const reportCSV = rows => {
-    const fields = ["fileOrder", "order", "x", "y", "visible", "status", "filename", "bytes", "httpStatus", "contentType", "url", "duplicateOf", "dedupeReason", "message"];
+    const fields = ["fileOrder", "order", "x", "y", "positionBasis", "positionSourceUrl", "visible", "status", "filename", "bytes", "httpStatus", "contentType", "url", "duplicateOf", "dedupeReason", "message"];
     const orderedRows = [...rows].sort((a, b) => (a.fileOrder || Infinity) - (b.fileOrder || Infinity) ||
       Number(["duplicate", "covered"].includes(a.status)) - Number(["duplicate", "covered"].includes(b.status)) || a.order - b.order);
     const quote = value => `"${String(value ?? "").replace(/"/g, '""')}"`;
@@ -1325,7 +1325,7 @@
       if (original) saved.set(row.url, original);
     }
     const covered = row => saved.has(row.url) || row.temporary &&
-      row.originalUrls?.some(href => saved.has(href)) || byUrl.get(row.url)?.status === "covered";
+      row.originalUrls?.some(href => saved.has(href));
     const missing = rows.filter(row => !covered(row)).map(row => {
       const result = byUrl.get(row.url);
       return { order: row.order, type: row.type, url: row.url, visible: row.visible,
@@ -1372,7 +1372,7 @@
         /\.(?:m3u8|mpd|url)$/i.test(row.filename) ? "<p>재생목록·외부 링크 파일: " + name + "</p>" :
           '<img loading="lazy" src="' + name + '" alt="' + title + '">';
       const coordinate = Number.isFinite(row.x) && Number.isFinite(row.y) ?
-        "x=" + row.x + ", y=" + row.y : "좌표 미확인 · 뒤쪽에 정렬";
+        "x=" + row.x + ", y=" + row.y + (row.positionBasis === "last-observed" ? " · 마지막 관찰 위치" : "") : "좌표 미확인 · 뒤쪽에 정렬";
       return "<article><h2>" + escape(row.fileOrder || "실패") + ". " + title + "</h2>" + media +
         "<p>" + escape(coordinate) + "</p><p>" + escape(row.status) + " · " + name +
         " · 후보 " + escape(row.order) + "</p><small>" + escape(row.url) + "</small></article>";

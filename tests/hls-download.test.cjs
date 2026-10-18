@@ -175,12 +175,12 @@ mediaTest('color VUI presence changes and restoration produce avc3 with unchange
   const report = await grab.download({ hls: 'mp4', start: 2, end: 2 });
   const row = report.results[0];
   assert.equal(row.status, 'packed', row.message);
-  assert.equal(row.filename, '0002.mp4');
+  assert.equal(row.filename, '0001.mp4');
   assert.equal(row.avcInBandParameterSets, true);
   assert.equal(row.colorConfigurationChanges, 2);
   const files = await unzip(archives[0]), output = join(folder, 'result.mp4');
-  assert.deepEqual(mediaFiles(files), ['0002.mp4']);
-  fs.writeFileSync(output, files['0002.mp4']);
+  assert.deepEqual(mediaFiles(files), ['0001.mp4']);
+  fs.writeFileSync(output, files['0001.mp4']);
   const hashes = decodeHashes(output);
   assert.equal(hashes.length, 30);
   assert.deepEqual(hashes, decodeHashes(join(folder, 'mixed.m3u8')));
@@ -216,7 +216,7 @@ mediaTest('resolution, sample aspect ratio and same-rate audio channel changes r
   assert.match(report.results[0].message, /코덱·해상도·트랙 정보/);
   assert.match(report.results[1].message, /코덱·해상도·트랙 정보/);
   assert.match(report.results[2].message, /코덱·해상도·트랙 정보/);
-  assert.deepEqual(mediaFiles(await unzip(archives[0])), ['0004.mp4']);
+  assert.deepEqual(mediaFiles(await unzip(archives[0])), ['0001.mp4']);
   assert.equal(report.results[3].avcInBandParameterSets, undefined, 'unchanged AVC streams retain their existing format');
 });
 
@@ -235,10 +235,10 @@ mediaTest('color changes whose SPS and PPS are missing from MP4 samples are not 
   assert.deepEqual(Array.from(report.results, row => row.status), ['failed', 'failed', 'packed']);
   assert.match(report.results[0].message, /SPS·PPS.*IDR 프레임/);
   assert.match(report.results[1].message, /SPS·PPS.*IDR 프레임/);
-  assert.deepEqual(mediaFiles(await unzip(archives[0])), ['0003.mp4']);
+  assert.deepEqual(mediaFiles(await unzip(archives[0])), ['0001.mp4']);
 });
 
-mediaTest('console HLS selects supported signed variants and preserves every frame, audio and original numbering in a valid ZIP', async t => {
+mediaTest('console HLS selects supported signed variants and preserves every frame, audio and candidate orders and contiguous file numbering in a valid ZIP', async t => {
   const folder = fs.mkdtempSync(join(tmpdir(), 'scraper-hls-'));
   t.after(() => fs.rmSync(folder, { recursive: true, force: true }));
   encode(folder, 'av'); encode(folder, 'silent', false);
@@ -258,7 +258,7 @@ mediaTest('console HLS selects supported signed variants and preserves every fra
   const { grab, archives } = runtime(server.base, resources);
   const report = await grab.downloadHls();
   assert.deepEqual(Array.from(report.results, row => [row.order, row.status, row.filename, row.hasAudio]), [
-    [2, 'packed', '0002.mp4', true], [3, 'packed', '0003.mp4', false]
+    [2, 'packed', '0001.mp4', true], [3, 'packed', '0002.mp4', false]
   ]);
   assert.ok(server.requests.includes('/master.m3u8?token=root%2Bsig'));
   assert.ok(server.requests.includes('/variants/av.m3u8?token=a%2Bb'));
@@ -269,8 +269,8 @@ mediaTest('console HLS selects supported signed variants and preserves every fra
   resources.push('/new-image.jpg');
   assert.equal(grab.getManifest().items.length, 4, 'unrelated new resources must still be collected');
   const files = await unzip(archives[0]);
-  assert.deepEqual(mediaFiles(files), ['0002.mp4', '0003.mp4']);
-  for (const [name, original, audio] of [['0002.mp4', 'av', true], ['0003.mp4', 'silent', false]]) {
+  assert.deepEqual(mediaFiles(files), ['0001.mp4', '0002.mp4']);
+  for (const [name, original, audio] of [['0001.mp4', 'av', true], ['0002.mp4', 'silent', false]]) {
     const output = join(folder, name); fs.writeFileSync(output, files[name]);
     const hashes = decodeHashes(output);
     assert.equal(hashes.length, 20);
@@ -301,7 +301,7 @@ mediaTest('failed or truncated HLS never produces a partial MP4 and the next str
   assert.deepEqual(Array.from(report.results, row => row.status), ['failed', 'failed', 'packed']);
   assert.equal(report.results[0].httpStatus, 403);
   assert.match(report.results[1].message, /손상/);
-  assert.deepEqual(mediaFiles(await unzip(archives[0])), ['0003.mp4']);
+  assert.deepEqual(mediaFiles(await unzip(archives[0])), ['0001.mp4']);
 });
 
 test('encrypted, live, fMP4, discontinuous, byte-range, missing and separately tracked HLS are explicit failures before requesting media', async t => {
@@ -391,4 +391,5 @@ test('HLS metadata size and nested playlist limits stop before requesting more c
   assert.equal(server.requests.filter(path => path.startsWith('/depth')).length, 5);
   assert.deepEqual(mediaFiles(await unzip(archives[0])), []);
 });
+
 
