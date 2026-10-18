@@ -1,6 +1,7 @@
 (() => {
   // 스니펫을 다시 실행하면 이전 감시기를 해제합니다.
   try { window.mediaGrab?.stopWatching?.(); } catch {}
+  try { window.mediaGrab?.hideNumbers?.(); } catch {}
   const found = new Map(), excluded = new Map(), blockedFrames = new Set(), reviewPreviews = new Map();
   // 병합 도중 요청한 하위 목록·조각이 새 수집 항목으로 다시 들어오는 것을 막습니다.
   const downloadOnlyResources = new Set();
@@ -109,6 +110,7 @@
           row.visible === visible && (!row.position || comparePosition(position, row.position) < 0 ||
           comparePosition(position, row.position) === 0 && element < row.element))) {
         Object.assign(row, { position, visible, element, source });
+        row.lastKnownPosition = { ...position };
       }
     } catch {}
   };
@@ -1168,6 +1170,8 @@
   }).map((r, i) => ({
     order: i + 1, type: r.type, url: r.url, source: r.source, temporary: r.temporary,
     top: r.position?.top ?? null, left: r.position?.left ?? null, visible: r.visible,
+    x: r.position?.left ?? null, y: r.position?.top ?? null,
+    ...(r.lastKnownPosition ? { lastKnownPosition: { ...r.lastKnownPosition } } : {}),
     ...(r.provider ? { provider: r.provider, ...(r.videoId ? { videoId: r.videoId } : {}),
       ...(r.embedUrl ? { embedUrl: r.embedUrl } : {}) } : {}),
     ...(r.videoTitle ? { videoTitle: r.videoTitle } : {}),
@@ -1223,31 +1227,64 @@
   };
   const makeZip = entries => {
     const encoder = new TextEncoder(), local = [], central = [];
-    let offset = 0, centralSize = 0;
+    const limit = 0xffffffff;
+    let offset = 0, centralSize = 0, zip64 = entries.length >= 65535;
+    // PKWARE APPNOTE 4.3.14–16 / 4.5.3. 큰 파일·오프셋·항목 수는 ZIP64로 기록합니다.
+    const uint64 = (view, at, value) => {
+      if (!Number.isSafeInteger(value) || value < 0) throw new Error("ZIP 크기를 안전하게 표현할 수 없습니다.");
+      view.setUint32(at, value % 0x100000000, true);
+      view.setUint32(at + 4, Math.floor(value / 0x100000000), true);
+    };
+    const extra = values => {
+      if (!values.length) return new Uint8Array();
+      const bytes = new Uint8Array(4 + values.length * 8), view = new DataView(bytes.buffer);
+      view.setUint16(0, 1, true); view.setUint16(2, bytes.length - 4, true);
+      values.forEach((value, i) => uint64(view, 4 + i * 8, value));
+      return bytes;
+    };
     const now = new Date(), year = Math.min(2107, Math.max(1980, now.getFullYear()));
     const time = now.getHours() << 11 | now.getMinutes() << 5 | now.getSeconds() >>> 1;
     const date = year - 1980 << 9 | now.getMonth() + 1 << 5 | now.getDate();
-    if (entries.length >= 65535) throw new Error("ZIP 항목 수가 너무 많습니다.");
     for (const entry of entries) {
-      const name = encoder.encode(entry.name), header = new Uint8Array(30 + name.length);
+      if (!Number.isSafeInteger(entry.size) || entry.size < 0 || entry.blob.size !== entry.size) throw new Error("ZIP 파일 크기가 실제 데이터와 다릅니다.");
+      const largeSize = entry.size >= limit, largeOffset = offset >= limit;
+      const name = encoder.encode(entry.name);
+      if (name.length > 65535) throw new Error("ZIP 파일명이 너무 깁니다.");
+      const localExtra = extra(largeSize ? [entry.size, entry.size] : []);
+      const centralExtra = extra([...(largeSize ? [entry.size, entry.size] : []), ...(largeOffset ? [offset] : [])]);
+      const needed = largeSize || largeOffset ? 45 : 20;
+      zip64 ||= largeSize || largeOffset;
+      const header = new Uint8Array(30 + name.length + localExtra.length);
       const h = new DataView(header.buffer);
-      h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true);
+      h.setUint32(0, 0x04034b50, true); h.setUint16(4, needed, true); h.setUint16(6, 0x0800, true);
       h.setUint16(10, time, true); h.setUint16(12, date, true); h.setUint32(14, entry.crc, true);
-      h.setUint32(18, entry.size, true); h.setUint32(22, entry.size, true); h.setUint16(26, name.length, true);
-      header.set(name, 30);
-      const directory = new Uint8Array(46 + name.length), d = new DataView(directory.buffer);
-      d.setUint32(0, 0x02014b50, true); d.setUint16(4, 20, true); d.setUint16(6, 20, true);
+      h.setUint32(18, largeSize ? limit : entry.size, true); h.setUint32(22, largeSize ? limit : entry.size, true);
+      h.setUint16(26, name.length, true); h.setUint16(28, localExtra.length, true);
+      header.set(name, 30); header.set(localExtra, 30 + name.length);
+      const directory = new Uint8Array(46 + name.length + centralExtra.length), d = new DataView(directory.buffer);
+      d.setUint32(0, 0x02014b50, true); d.setUint16(4, needed, true); d.setUint16(6, needed, true);
       d.setUint16(8, 0x0800, true); d.setUint16(12, time, true); d.setUint16(14, date, true);
-      d.setUint32(16, entry.crc, true); d.setUint32(20, entry.size, true); d.setUint32(24, entry.size, true);
-      d.setUint16(28, name.length, true); d.setUint32(42, offset, true); directory.set(name, 46);
+      d.setUint32(16, entry.crc, true); d.setUint32(20, largeSize ? limit : entry.size, true); d.setUint32(24, largeSize ? limit : entry.size, true);
+      d.setUint16(28, name.length, true); d.setUint16(30, centralExtra.length, true);
+      d.setUint32(42, largeOffset ? limit : offset, true); directory.set(name, 46); directory.set(centralExtra, 46 + name.length);
       local.push(header, entry.blob); central.push(directory);
       offset += header.length + entry.size; centralSize += directory.length;
-      if (offset + centralSize + 22 >= 0xffffffff) throw new Error("ZIP32의 용량 한도를 넘었습니다.");
+      if (!Number.isSafeInteger(offset + centralSize + 98)) throw new Error("ZIP 크기를 안전하게 표현할 수 없습니다.");
+    }
+    zip64 ||= offset >= limit || centralSize >= limit;
+    const extensions = [];
+    if (zip64) {
+      const record = new Uint8Array(56), r = new DataView(record.buffer);
+      r.setUint32(0, 0x06064b50, true); uint64(r, 4, 44); r.setUint16(12, 45, true); r.setUint16(14, 45, true);
+      uint64(r, 24, entries.length); uint64(r, 32, entries.length); uint64(r, 40, centralSize); uint64(r, 48, offset);
+      const locator = new Uint8Array(20), l = new DataView(locator.buffer);
+      l.setUint32(0, 0x07064b50, true); uint64(l, 8, offset + centralSize); l.setUint32(16, 1, true);
+      extensions.push(record, locator);
     }
     const end = new Uint8Array(22), e = new DataView(end.buffer);
-    e.setUint32(0, 0x06054b50, true); e.setUint16(8, entries.length, true); e.setUint16(10, entries.length, true);
-    e.setUint32(12, centralSize, true); e.setUint32(16, offset, true);
-    return new Blob([...local, ...central, end], { type: "application/zip" });
+    e.setUint32(0, 0x06054b50, true); e.setUint16(8, Math.min(entries.length, 65535), true); e.setUint16(10, Math.min(entries.length, 65535), true);
+    e.setUint32(12, Math.min(centralSize, limit), true); e.setUint32(16, Math.min(offset, limit), true);
+    return new Blob([...local, ...central, ...extensions, end], { type: "application/zip" });
   };
   const requestSave = (href, filename) => {
     const link = document.createElement("a");
@@ -1269,7 +1306,7 @@
     return `${name}.json`;
   };
   const reportCSV = rows => {
-    const fields = ["order", "status", "filename", "bytes", "httpStatus", "contentType", "url", "message"];
+    const fields = ["fileOrder", "order", "x", "y", "visible", "status", "filename", "bytes", "httpStatus", "contentType", "url", "duplicateOf", "dedupeReason", "message"];
     const quote = value => `"${String(value ?? "").replace(/"/g, '""')}"`;
     return "\ufeff" + [fields, ...rows.map(row => fields.map(field => row[field]))]
       .map(row => row.map(quote).join(",")).join("\r\n") + "\r\n";
@@ -1281,6 +1318,10 @@
       if (row.resolvedFrom) saved.set(row.resolvedFrom, row);
     }
     const byUrl = new Map(results.map(row => [row.url, row]));
+    for (const row of results) if (["duplicate", "covered"].includes(row.status)) {
+      const original = saved.get(row.duplicateOf || row.coveredBy);
+      if (original) saved.set(row.url, original);
+    }
     const covered = row => saved.has(row.url) || row.temporary &&
       row.originalUrls?.some(href => saved.has(href)) || byUrl.get(row.url)?.status === "covered";
     const missing = rows.filter(row => !covered(row)).map(row => {
@@ -1304,6 +1345,7 @@
       pendingResponses, collectionErrors,
       packedUrls: results.filter(row => row.status === "packed").length,
       coveredTemporaryUrls: results.filter(row => row.status === "covered").length,
+      duplicateVideoUrls: results.filter(row => row.status === "duplicate").length,
       visibleUrls: rows.filter(row => row.visible).length, missingUrls: missing,
       missingVisibleUrls: missing.filter(row => row.visible), pendingVideoThumbnails: pendingVideos.length,
       expectedAmazonVideos: amazon.expectedVideos || 0,
@@ -1319,23 +1361,33 @@
   const previewHTML = rows => {
     const escape = value => String(value ?? "").replace(/[&<>"']/g,
       char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
-    const cards = rows.map(row => {
+    const cards = rows.filter(row => !["duplicate", "covered"].includes(row.status)).sort((a, b) =>
+      (a.fileOrder || Infinity) - (b.fileOrder || Infinity) || a.order - b.order).map(row => {
       const name = escape(row.filename), title = escape(row.videoTitle || row.filename || row.type);
       const media = row.status !== "packed" ? "<p>" + escape(row.message || row.status) + "</p>" :
         /\.(?:mp4|webm|m4v|mov|ogv)$/i.test(row.filename) ?
           '<video controls preload="metadata" src="' + name + '"></video>' :
         /\.(?:m3u8|mpd|url)$/i.test(row.filename) ? "<p>재생목록·외부 링크 파일: " + name + "</p>" :
           '<img loading="lazy" src="' + name + '" alt="' + title + '">';
-      return "<article><h2>" + escape(row.order) + ". " + title + "</h2>" + media +
-        "<p>" + escape(row.status) + " · " + name + "</p><small>" + escape(row.url) + "</small></article>";
+      const coordinate = Number.isFinite(row.x) && Number.isFinite(row.y) ?
+        "x=" + row.x + ", y=" + row.y : "좌표 미확인 · 뒤쪽에 정렬";
+      return "<article><h2>" + escape(row.fileOrder || "실패") + ". " + title + "</h2>" + media +
+        "<p>" + escape(coordinate) + "</p><p>" + escape(row.status) + " · " + name +
+        " · 후보 " + escape(row.order) + "</p><small>" + escape(row.url) + "</small></article>";
     }).join("\n");
+    const duplicates = rows.filter(row => ["duplicate", "covered"].includes(row.status)).map(row =>
+      "<tr><td>" + escape(row.filename) + "</td><td>" + escape(row.dedupeReason || row.message) +
+      "</td><td>" + escape(row.url) + "</td></tr>").join("");
     return '<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width">' +
       "<title>미디어 다운로드 검토</title><style>body{font:15px system-ui;margin:24px;background:#f5f6f8;color:#17202a}" +
       "main{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}" +
       "article{background:white;padding:16px;border:1px solid #ddd;border-radius:10px;min-width:0}" +
-      "h2{font-size:15px}img,video{max-width:100%;max-height:320px}small{overflow-wrap:anywhere}</style>" +
+      "h2{font-size:15px}img,video{max-width:100%;max-height:320px}small,td{overflow-wrap:anywhere}table{table-layout:fixed;width:100%}td{padding:8px;border-bottom:1px solid #ddd}</style>" +
       "<h1>미디어 다운로드 검토</h1><p>압축을 푼 뒤 이 파일을 여세요. 아래 미디어는 ZIP에 저장된 로컬 파일입니다. " +
-      "누락 여부와 실패 원인은 page-audit.json 및 failed.csv에서 확인하세요.</p><main>" + cards + "</main></html>";
+      "파일 번호는 y(위→아래), x(왼쪽→오른쪽) 순서이며 좌표 미확인 항목은 뒤에 둡니다. " +
+      "페이지에서는 mediaGrab.showNumbers()로 같은 파일 번호를 표시할 수 있습니다. " +
+      "누락 여부와 실패 원인은 page-audit.json 및 failed.csv에서 확인하세요.</p><main>" + cards +
+      "</main><h2>같은 저장 파일로 연결한 주소</h2><table><tr><th>저장 파일</th><th>근거</th><th>원본 URL</th></tr>" + duplicates + "</table></html>";
   };
   const readMedia = async (url, options, signal, inspect = true) => {
     if (!found.has(url)) downloadOnlyResources.add(url);
@@ -1726,9 +1778,61 @@
         playlistDurationSeconds: list.segments.reduce((sum, segment) => sum + segment.duration, 0) };
     } finally { transmuxer.dispose(); }
   };
+  const videoIdentity = row => {
+    const tokens = ["url:" + row.url];
+    if (row.temporary) for (const href of row.originalUrls || []) tokens.push("url:" + href);
+    if (row.provider === "amazon" && /^amzn1\.(?:vse|ive|productreview)\./.test(row.videoId || "")) tokens.push("amazon.id:" + row.videoId);
+    try {
+      const u = new URL(row.url), asset = u.pathname.match(/^\/images\/S\/vse-vms-transcoding-artifact[^/]*\/([\da-f-]{36})\//i);
+      if (u.hostname === "m.media-amazon.com" && asset) tokens.push("amazon.asset:" + asset[1].toLowerCase());
+    } catch {}
+    return tokens;
+  };
+  const sourcePreference = row => {
+    if (row.temporary) return -1;
+    const height = row.url.match(/(?:hls|mp4\.)(\d{3,4})(?:\.m3u8|\.mp4)(?:$|[?#])/i)?.[1];
+    const master = row.type === "STREAM" && /\.m3u8(?:$|[?#])/i.test(row.url) && !height;
+    return (master ? 10000000 : height ? Number(height) ** 2 : 1000000) +
+      (/embedded\.cc\./i.test(row.url) ? 0 : 1);
+  };
+  const downloadGroups = (rows, deduplicate) => {
+    const groups = [], owners = new Map();
+    for (const row of rows) {
+      if (!deduplicate || !["VIDEO", "STREAM"].includes(row.type)) { groups.push({ rows: [row] }); continue; }
+      const tokens = videoIdentity(row), matches = [...new Set(tokens.map(token => owners.get(token)).filter(Boolean))];
+      const group = matches[0] || { rows: [] };
+      if (!matches.length) groups.push(group);
+      for (const other of matches.slice(1)) {
+        group.rows.push(...other.rows); other.merged = true;
+        for (const [token, value] of owners) if (value === other) owners.set(token, group);
+      }
+      group.rows.push(row);
+      for (const token of tokens) owners.set(token, group);
+    }
+    return groups.filter(group => !group.merged).map(group => ({ ...group,
+      rows: group.rows.sort((a, b) => a.order - b.order),
+      candidates: [...group.rows].sort((a, b) => sourcePreference(b) - sourcePreference(a) || a.order - b.order) }));
+  };
+  const sameMediaBytes = async (a, b, signal) => {
+    if (a.size !== b.size || a.crc !== b.crc) return false;
+    for (let offset = 0; offset < a.size; offset += 1024 ** 2) {
+      if (signal.aborted) throw new Error("사용자가 중단했습니다.");
+      const end = Math.min(a.size, offset + 1024 ** 2);
+      const left = new Uint8Array(await a.blob.slice(offset, end).arrayBuffer());
+      const right = new Uint8Array(await b.blob.slice(offset, end).arrayBuffer());
+      if (!hlsSameBytes(left, right)) return false;
+    }
+    return true;
+  };
+  const mediaPosition = members => members.map(row => Number.isFinite(row.top) && Number.isFinite(row.left) ?
+    { ...row, positionBasis: "current-document" } : row.lastKnownPosition ?
+      { ...row, ...row.lastKnownPosition, positionBasis: "last-observed" } : row)
+    .filter(row => Number.isFinite(row.top) && Number.isFinite(row.left))
+    .sort((a, b) => a.top - b.top || a.left - b.left || a.order - b.order)[0];
   let downloadController = null, downloadReport = null, preparationRun = null, lastPreparation = null;
+  let numberOverlay = null;
   window.mediaGrab = {
-    version: "2026.10.18.1",
+    version: "2026.10.18.2",
     get exportFilename() { return manifestFilename(document.URL || document.location?.href || document.baseURI); },
     get rows() { return ordered(); },
     get urls() { return this.rows.map(r => r.url); },
@@ -1915,6 +2019,34 @@
       return { watching: false };
     },
     get lastDownload() { return downloadReport; },
+    hideNumbers() {
+      numberOverlay?.remove?.(); numberOverlay = null;
+      return { shown: false };
+    },
+    showNumbers() {
+      this.hideNumbers(); this.scan({ quiet: true });
+      if (!downloadReport?.finishedAt) throw new Error("먼저 mediaGrab.download()로 저장 파일 번호를 확정하세요.");
+      const byUrl = new Map(downloadReport.results.filter(row => row.filename && row.fileOrder).map(row => [row.url, row]));
+      const positions = new Map();
+      for (const row of this.visibleRows) {
+        const saved = byUrl.get(row.url);
+        if (!saved || !Number.isFinite(row.x) || !Number.isFinite(row.y)) continue;
+        const key = Math.round(row.x) + ":" + Math.round(row.y);
+        if (!positions.has(key)) positions.set(key, { x: row.x, y: row.y, numbers: new Set() });
+        positions.get(key).numbers.add(saved.fileOrder);
+      }
+      const overlay = document.createElement("div");
+      overlay.setAttribute("data-media-grab-numbers", "true");
+      overlay.style.cssText = "position:absolute;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none";
+      for (const position of positions.values()) {
+        const label = document.createElement("span");
+        label.textContent = [...position.numbers].sort((a, b) => a - b).map(n => String(n).padStart(4, "0")).join(", ");
+        label.style.cssText = `position:absolute;left:${position.x}px;top:${position.y}px;background:#b91c1c;color:white;border:1px solid white;padding:2px 4px;border-radius:3px;font:700 12px/1.4 monospace;white-space:nowrap;box-shadow:0 1px 4px #0008`;
+        overlay.appendChild(label);
+      }
+      (document.documentElement || document.body).appendChild(overlay); numberOverlay = overlay;
+      return { shown: true, markers: positions.size, note: "현재 렌더링된 위치의 실제 저장 파일 번호입니다. 좌표 미확인·숨겨진 항목은 ZIP 보고서를 확인하세요." };
+    },
     clearDownloads() {
       if (downloadController) throw new Error("다운로드 중에는 결과를 해제할 수 없습니다.");
       for (const archive of downloadReport?.archives || []) URL.revokeObjectURL(archive.url);
@@ -1930,141 +2062,157 @@
     downloadHls(options = {}) {
       return this.download({ ...options, streamsOnly: true, hls: "mp4" });
     },
-    async download({ visibleOnly = false, start = 1, end = Infinity, maxFileMB = 256, prepare = true,
-        maxZipMB = 256, timeoutMs = 30000, credentials = "same-origin", streamsOnly = false, hls = "mp4" } = {}) {
+    async download({ visibleOnly = false, start = 1, end = Infinity, maxFileMB = Infinity, prepare = true,
+        timeoutMs = 30000, credentials = "same-origin", streamsOnly = false, hls = "mp4", deduplicateVideos = true } = {}) {
       if (downloadController) throw new Error("이미 다운로드 중입니다. 중단하려면 mediaGrab.stopDownload()를 실행하세요.");
-      if (typeof prepare !== "boolean") throw new Error("prepare는 boolean이어야 합니다.");
-      if (![maxFileMB, maxZipMB].every(x => Number.isFinite(x) && x > 0 && x <= 1024) ||
+      if (typeof prepare !== "boolean" || typeof deduplicateVideos !== "boolean" ||
+          !(maxFileMB === Infinity || Number.isFinite(maxFileMB) && maxFileMB > 0) ||
           !Number.isFinite(timeoutMs) || timeoutMs <= 0 || !Number.isInteger(start) || start < 1 ||
           !(end === Infinity || Number.isInteger(end) && end >= start) ||
           !["same-origin", "omit", "include"].includes(credentials) || typeof streamsOnly !== "boolean" ||
           typeof visibleOnly !== "boolean" || !["playlist", "mp4"].includes(hls)) throw new Error("다운로드 옵션을 확인하세요.");
       if (prepare) await this.prepare();
-      this.scan({ quiet: true });
-      // 목록 응답이 도착하는 중이면 복제 본문 수집을 기다린 뒤 대상을 확정합니다.
-      await waitReviewTasks();
+      this.scan({ quiet: true }); await waitReviewTasks();
       if (downloadController) throw new Error("이미 다운로드 중입니다. 중단하려면 mediaGrab.stopDownload()를 실행하세요.");
       this.scan({ quiet: true });
       const rows = (visibleOnly ? this.visibleRows : this.rows).filter(row => row.order >= start && row.order <= end &&
         (!streamsOnly || row.type === "STREAM"));
       let observedRows = this.rows;
       if (!rows.length) throw new Error("대상 주소가 없습니다. 상세내용을 펼치고 mediaGrab.scan()으로 다시 수집하세요.");
-      this.clearDownloads();
+      this.hideNumbers(); this.clearDownloads();
       downloadController = new AbortController();
-      const signal = downloadController.signal, width = Math.max(4, String(rows.at(-1).order).length);
-      const options = { timeoutMs, credentials, maxFileBytes: Math.floor(maxFileMB * 1024 ** 2) };
-      const zipLimit = Math.floor(maxZipMB * 1024 ** 2), stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "");
-      const pageUrl = document.URL || document.baseURI;
+      const signal = downloadController.signal;
+      const options = { timeoutMs, credentials, maxFileBytes: maxFileMB === Infinity ? Infinity : Math.floor(maxFileMB * 1024 ** 2) };
+      const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, ""), pageUrl = document.URL || document.baseURI;
       downloadReport = { schema: "media-grab-download/1", pageUrl, startedAt: new Date().toISOString(),
-        finishedAt: null, results: [], archives: [], cancelled: false,
-        preparation: lastPreparation,
-        blockedFrames: this.blockedFrames,
-        collectorVersion: this.version, pendingVideos: this.pendingVideos, amazonCollection: this.amazonCollection,
-        reviewCollection: this.reviewCollection };
-      let entries = [], partResults = [], partBytes = 0;
-      const parts = [];
-      const flush = () => {
-        if (!partResults.length) return;
-        // 앞쪽 ZIP에도 최종 대조 결과를 넣도록 모든 주소의 처리가 끝난 뒤 저장합니다.
-        parts.push({ entries, results: partResults });
-        entries = []; partResults = []; partBytes = 0;
-      };
-      const saveParts = () => {
-        for (const [part, contents] of parts.entries()) {
-          const index = part + 1, filename = `page-media-${stamp}-${String(index).padStart(3, "0")}.zip`;
-          const session = { startedAt: downloadReport.startedAt, finishedAt: downloadReport.finishedAt,
-            cancelled: downloadReport.cancelled, totalResults: downloadReport.results.length,
-            part: index, totalParts: parts.length };
-          const blob = makeZip([...contents.entries,
-          textEntry("download-report.json", JSON.stringify({ pageUrl, collectorVersion: downloadReport.collectorVersion,
-            pendingVideos: downloadReport.pendingVideos, amazonCollection: downloadReport.amazonCollection,
-            reviewCollection: downloadReport.reviewCollection, preparation: downloadReport.preparation,
-            session, audit: downloadReport.audit, results: contents.results }, null, 2)),
-          textEntry("download-report.csv", reportCSV(contents.results)),
-          textEntry("failed.csv", reportCSV(contents.results.filter(row => ["failed", "skipped"].includes(row.status)))),
-          textEntry("page-audit.json", JSON.stringify(downloadReport.audit, null, 2)),
-          textEntry("preview.html", previewHTML(contents.results))]);
-          const archive = { index, filename, bytes: blob.size, url: URL.createObjectURL(blob), downloadRequested: false };
-          downloadReport.archives.push(archive);
-          try { requestSave(archive.url, filename); archive.downloadRequested = true; }
-          catch (error) { archive.message = error.message; }
-          console.log(`ZIP ${index} 저장 요청: ${filename}. 시작되지 않으면 mediaGrab.saveArchive(${index})`);
-        }
-      };
-      console.log(`브라우저에서 ${rows.length}개 주소를 읽어 ZIP으로 저장합니다. 중단: mediaGrab.stopDownload()`);
+        finishedAt: null, results: [], archives: [], cancelled: false, preparation: lastPreparation,
+        blockedFrames: this.blockedFrames, collectorVersion: this.version, pendingVideos: this.pendingVideos,
+        amazonCollection: this.amazonCollection, reviewCollection: this.reviewCollection,
+        ordering: "y-then-x; unplaced-last; contiguous-fileOrder", deduplicateVideos, archiveStatus: "collecting" };
+      const artifacts = [], byteCandidates = new Map(), groups = downloadGroups(rows, deduplicateVideos);
+      const baseResult = row => ({ ...row, fileOrder: null, status: "failed", filename: "", bytes: 0,
+        httpStatus: "", contentType: "", message: "" });
       try {
-        for (const [i, row] of rows.entries()) {
-          const result = { ...row, status: "failed", filename: "", bytes: 0, httpStatus: "", contentType: "", message: "" };
-          if (signal.aborted) Object.assign(result, { status: "skipped", message: "사용자가 중단했습니다." });
-          else if (row.type === "EMBED") {
-            const filename = `${String(row.order).padStart(width, "0")}.url`;
-            const link = textEntry(filename, `[InternetShortcut]\r\nURL=${row.url}\r\n`);
-            if (entries.length && partBytes + link.size > zipLimit) flush();
-            entries.push(link); partBytes += link.size;
-            Object.assign(result, { status: "link", filename, bytes: link.size,
-              message: "유튜브 영상 페이지 링크를 저장했습니다. 영상 파일은 포함되지 않았습니다." });
-          } else {
+        for (const group of groups) {
+          const attempts = [];
+          let artifact = null;
+          for (const row of group.candidates) {
+            if (signal.aborted) break;
             try {
-              const original = row.temporary && row.originalUrls?.find(href =>
-                observedRows.some(candidate => candidate.url === href && !candidate.temporary));
-              const saved = original && downloadReport.results.find(candidate =>
-                candidate.url === original && candidate.status === "packed");
-              if (saved) {
-                Object.assign(result, { status: "covered", filename: saved.filename, coveredBy: original,
-                  message: "같은 재생 요소의 확인된 원본을 " + saved.filename + "에 저장했습니다." });
-                partResults.push(result); downloadReport.results.push(result);
-                continue;
+              let data;
+              if (row.type === "EMBED") data = { ...textEntry("", `[InternetShortcut]\r\nURL=${row.url}\r\n`), extension: ".url" };
+              else {
+                const original = row.temporary && row.originalUrls?.find(href => observedRows.some(candidate => candidate.url === href && !candidate.temporary));
+                const resourceUrl = original || row.url;
+                const firstOptions = hls === "mp4" && row.type === "STREAM" ?
+                  { ...options, maxFileBytes: Math.min(options.maxFileBytes, 2 * 1024 ** 2) } : options;
+                data = await readMedia(resourceUrl, firstOptions, signal);
+                if (hls === "mp4" && data.extension === ".m3u8") data = await readHls(resourceUrl, data, options, signal);
+                if (hls === "mp4" && data.extension === ".mpd") throw new Error("DASH 영상은 콘솔 MP4 저장을 지원하지 않습니다.");
+                if (original) data.resolvedFrom = original;
               }
-              const resourceUrl = original || row.url;
-              const firstOptions = hls === "mp4" && row.type === "STREAM" ?
-                { ...options, maxFileBytes: Math.min(options.maxFileBytes, 2 * 1024 ** 2) } : options;
-              let data = await readMedia(resourceUrl, firstOptions, signal);
-              if (hls === "mp4" && data.extension === ".m3u8") data = await readHls(resourceUrl, data, options, signal);
-              if (hls === "mp4" && data.extension === ".mpd") throw new Error("DASH 영상은 콘솔 MP4 저장을 지원하지 않습니다.");
-              if (entries.length && (partBytes + data.size > zipLimit || entries.length >= 10000)) flush();
-              const filename = `${String(row.order).padStart(width, "0")}${data.extension}`;
-              entries.push({ name: filename, ...data }); partBytes += data.size;
-              Object.assign(result, { status: [".m3u8", ".mpd"].includes(data.extension) ? "playlist" : "packed",
-                filename, bytes: data.size, httpStatus: data.httpStatus, contentType: data.contentType });
-              if (original) result.resolvedFrom = original;
-              if (data.segments) Object.assign(result, { segments: data.segments, format: data.format,
-                width: data.width, height: data.height, hasAudio: data.hasAudio,
-                playlistUrl: data.playlistUrl, playlistDurationSeconds: data.playlistDurationSeconds,
-                ...(data.avcInBandParameterSets ? { avcInBandParameterSets: true, colorConfigurationChanges: data.colorConfigurationChanges } : {}),
-                message: `HLS 영상 조각 ${data.segments}개를 MP4로 합쳤습니다.` +
-                  (data.avcInBandParameterSets ? ` 색상 설정 변경 ${data.colorConfigurationChanges}회를 원본 SPS·PPS와 함께 보존했습니다.` : "") });
-              if (result.status === "playlist") result.message = "재생목록만 저장합니다. 영상 조각을 합치지는 않습니다.";
+              const result = Object.assign(baseResult(row), { status: row.type === "EMBED" ? "link" :
+                [".m3u8", ".mpd"].includes(data.extension) ? "playlist" : "packed",
+                bytes: data.size, httpStatus: data.httpStatus || "", contentType: data.contentType || "" });
+              for (const field of ["resolvedFrom", "segments", "format", "width", "height", "hasAudio", "playlistUrl",
+                  "playlistDurationSeconds", "avcInBandParameterSets", "colorConfigurationChanges"]) {
+                if (data[field] !== undefined) result[field] = data[field];
+              }
+              if (data.segments) result.message = `HLS 영상 조각 ${data.segments}개를 MP4로 합쳤습니다.`;
+              if (result.status === "playlist") result.message = "재생목록만 저장합니다. 영상 파일은 포함되지 않았습니다.";
+              if (result.status === "link") result.message = "유튜브 영상 페이지 링크를 저장했습니다. 영상 파일은 포함되지 않았습니다.";
+              const video = ["VIDEO", "STREAM"].includes(row.type) && result.status === "packed" &&
+                /^\.(?:mp4|webm|m4v|mov|ogv|avi|mkv|mpeg)$/i.test(data.extension);
+              const byteKey = data.size + ":" + data.crc;
+              if (deduplicateVideos && video) for (const previous of byteCandidates.get(byteKey) || []) {
+                if (await sameMediaBytes(previous.data, data, signal)) { artifact = previous; break; }
+              }
+              if (!artifact) {
+                artifact = { result, data, members: [], aliases: [] };
+                artifacts.push(artifact); downloadReport.results.push(result);
+                if (deduplicateVideos && video) {
+                  if (!byteCandidates.has(byteKey)) byteCandidates.set(byteKey, []);
+                  byteCandidates.get(byteKey).push(artifact);
+                }
+              }
+              attempts.push({ url: row.url, status: "read", bytes: data.size });
+              break;
             } catch (error) {
-              Object.assign(result, { status: signal.aborted ? "skipped" : "failed", message: error.message,
+              attempts.push({ url: row.url, status: signal.aborted ? "skipped" : "failed", message: error.message,
                 httpStatus: error.httpStatus || "", contentType: error.contentType || "" });
             }
           }
-          partResults.push(result); downloadReport.results.push(result);
-          if ((i + 1) % 25 === 0 || i + 1 === rows.length) console.log(`ZIP 준비 ${i + 1}/${rows.length}`);
+          if (artifact) {
+            artifact.members.push(...group.rows);
+            for (const field of ["provider", "videoId", "videoTitle", "thumbnailUrl"]) {
+              if (!artifact.result[field]) artifact.result[field] = group.rows.find(row => row[field])?.[field];
+            }
+            const playlists = [...new Set(group.rows.flatMap(row => row.playlists || []))];
+            if (playlists.length) artifact.result.playlists = [...new Set([...(artifact.result.playlists || []), ...playlists])];
+            artifact.result.attempts = [...(artifact.result.attempts || []), ...attempts];
+            for (const row of group.rows) {
+              if (row.url === artifact.result.url) continue;
+              const reason = attempts.some(attempt => attempt.url === row.url && attempt.status === "read") ?
+                "동영상 파일 전체 바이트 일치" : "동일 재생 요소·Amazon 영상 ID 또는 트랜스코딩 자산의 대체 주소";
+              const duplicate = Object.assign(baseResult(row), { status: row.temporary ? "covered" : "duplicate",
+                duplicateOf: artifact.result.url, coveredBy: artifact.result.url, dedupeReason: reason,
+                message: reason + ". 대표 원본 파일에 연결했습니다." });
+              artifact.aliases.push(duplicate); downloadReport.results.push(duplicate);
+            }
+          } else for (const row of group.rows) {
+            const failed = attempts.find(attempt => attempt.url === row.url);
+            downloadReport.results.push(Object.assign(baseResult(row), failed || {
+              status: signal.aborted ? "skipped" : "failed", message: signal.aborted ? "사용자가 중단했습니다." : "같은 영상의 모든 원본을 읽지 못했습니다."
+            }, { attempts }));
+          }
+          if (downloadReport.results.length % 25 === 0 || downloadReport.results.length === rows.length) {
+            console.log(`미디어 준비 ${downloadReport.results.length}/${rows.length} URL · 실제 파일 ${artifacts.length}개`);
+          }
         }
+        // URL 후보 순번과 실제 저장 파일 순번을 구분합니다. 대표 화질의 위치도 같은 영상의 첫 위치를 사용합니다.
+        for (const artifact of artifacts) {
+          const position = mediaPosition(artifact.members);
+          if (position) Object.assign(artifact.result, { top: position.top, left: position.left, x: position.left, y: position.top,
+            positionSourceUrl: position.url, positionBasis: position.positionBasis });
+        }
+        artifacts.sort((a, b) => {
+          const p = mediaPosition(a.members), q = mediaPosition(b.members);
+          if (Boolean(p) !== Boolean(q)) return p ? -1 : 1;
+          return p && q ? p.top - q.top || p.left - q.left || a.result.order - b.result.order : a.result.order - b.result.order;
+        });
+        const width = Math.max(4, String(artifacts.length).length);
+        artifacts.forEach((artifact, index) => {
+          const filename = String(index + 1).padStart(width, "0") + artifact.data.extension;
+          Object.assign(artifact.result, { filename, fileOrder: index + 1 });
+          for (const alias of artifact.aliases) Object.assign(alias, { filename, fileOrder: index + 1 });
+        });
+        downloadReport.results.sort((a, b) => a.order - b.order);
         downloadReport.cancelled = signal.aborted; downloadReport.finishedAt = new Date().toISOString();
-        // 저장 중 실제 페이지가 바뀌었다면 새 주소도 누락으로 드러내며 성공으로 단정하지 않습니다.
         this.scan({ quiet: true }); observedRows = this.rows;
-        downloadReport.blockedFrames = this.blockedFrames;
-        downloadReport.amazonCollection = this.amazonCollection;
-        downloadReport.reviewCollection = this.reviewCollection;
-        downloadReport.pendingVideos = this.pendingVideos;
+        downloadReport.blockedFrames = this.blockedFrames; downloadReport.amazonCollection = this.amazonCollection;
+        downloadReport.reviewCollection = this.reviewCollection; downloadReport.pendingVideos = this.pendingVideos;
         downloadReport.audit = auditRows(observedRows, downloadReport.results, downloadReport.amazonCollection,
-          downloadReport.pendingVideos, true, downloadReport.preparation, downloadReport.blockedFrames,
-          downloadReport.reviewCollection);
-        flush();
-        saveParts();
-        const packed = downloadReport.results.filter(row => row.status === "packed").length;
-        const playlists = downloadReport.results.filter(row => row.status === "playlist").length;
-        const links = downloadReport.results.filter(row => row.status === "link").length;
-        const covered = downloadReport.results.filter(row => row.status === "covered").length;
-        const failed = downloadReport.results.filter(row => ["failed", "skipped"].includes(row.status)).length;
-        console.log(`완료: 미디어 ${packed}개 / 재생목록 ${playlists}개 / 외부 영상 링크 ${links}개 / 원본 저장으로 확인된 임시 주소 ${covered}개 / 실패·건너뜀 ${failed}개 / ZIP ${downloadReport.archives.length}개`);
-        console.log("페이지 대조 결과: mediaGrab.lastDownload.audit. ZIP의 preview.html과 page-audit.json을 확인하세요.");
-        if (this.pendingVideos.length) console.log(`아직 원본과 연결되지 않은 영상 썸네일 ${this.pendingVideos.length}개: mediaGrab.pendingVideos (보고서 JSON에도 포함)`);
-        console.log("상세 결과: mediaGrab.lastDownload. ZIP 안의 failed.csv에서 실패 주소를 확인하세요.");
+          downloadReport.pendingVideos, true, downloadReport.preparation, downloadReport.blockedFrames, downloadReport.reviewCollection);
+        downloadReport.archiveStatus = "ready";
+        const session = { startedAt: downloadReport.startedAt, finishedAt: downloadReport.finishedAt, cancelled: downloadReport.cancelled,
+          totalResults: downloadReport.results.length, totalFiles: artifacts.length, part: 1, totalParts: 1 };
+        const entries = artifacts.map(artifact => ({ ...artifact.data, name: artifact.result.filename }));
+        const results = downloadReport.results;
+        const blob = makeZip([...entries,
+          textEntry("download-report.json", JSON.stringify({ ...downloadReport, session, archives: undefined }, null, 2)),
+          textEntry("download-report.csv", reportCSV(results)),
+          textEntry("failed.csv", reportCSV(results.filter(row => ["failed", "skipped"].includes(row.status)))),
+          textEntry("duplicates.csv", reportCSV(results.filter(row => ["duplicate", "covered"].includes(row.status)))),
+          textEntry("page-audit.json", JSON.stringify(downloadReport.audit, null, 2)), textEntry("preview.html", previewHTML(results))]);
+        const filename = `page-media-${stamp}.zip`;
+        const archive = { index: 1, filename, bytes: blob.size, url: URL.createObjectURL(blob), downloadRequested: false };
+        downloadReport.archives.push(archive);
+        try { requestSave(archive.url, filename); archive.downloadRequested = true; } catch (error) { archive.message = error.message; }
+        console.log(`완료: 실제 파일 ${artifacts.length}개 · 중복 영상 주소 ${downloadReport.audit.duplicateVideoUrls}개 제외 · ZIP 1개 (${filename})`);
+        console.log("페이지 번호: mediaGrab.showNumbers() / 숨기기: mediaGrab.hideNumbers(). ZIP의 preview.html·download-report.csv·duplicates.csv로 대조하세요.");
         return downloadReport;
-      } finally { downloadController = null; }
+      } catch (error) { downloadReport.archiveStatus = "failed"; downloadReport.message = error.message; throw error; }
+      finally { downloadController = null; }
     },
     getManifest({ visibleOnly = false } = {}) {
       this.scan({ quiet: true });
