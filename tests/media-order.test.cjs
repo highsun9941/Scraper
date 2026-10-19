@@ -1363,7 +1363,7 @@ test('JSON manifest preserves full ordered addresses and omits excluded events',
   f.doc.body.append(f.img(long, 500), f.img('/first.jpg', 10));
   const manifest = f.run().getManifest();
   assert.equal(manifest.schema, 'media-grab/1');
-  assert.equal(manifest.collectorVersion, '2026.10.18.1');
+  assert.equal(manifest.collectorVersion, '2026.10.18.2');
   assert.equal(manifest.pageUrl, base);
   assert.equal(manifest.title, '상품 테스트');
   assert.ok(Number.isFinite(Date.parse(manifest.exportedAt)));
@@ -1611,6 +1611,19 @@ test('a known original from the same Video.js player covers its MediaSource with
   assert.equal(report.audit.missingUrls.length, 0);
 });
 
+test('a MediaSource alias of a saved playlist does not claim that the video bytes were collected', async () => {
+  const source = url('/same-player.m3u8'), blob = 'blob:https://shop.example/playlist-player';
+  const f = downloadFixture({ [source]: new Response('#EXTM3U\npart.ts\n') });
+  const wrapper = f.element('div', { attrs: { class: 'video-js' } });
+  wrapper.player = { currentSource: () => ({ src: source, type: 'application/vnd.apple.mpegurl' }) };
+  wrapper.append(f.element('video', { attrs: { src: blob } })); f.doc.body.append(wrapper);
+  const report = await f.run().download({ prepare: false, hls: 'playlist' });
+  assert.equal(report.results.find(r => r.url === source).status, 'playlist');
+  assert.equal(report.results.find(r => r.url === blob).status, 'covered');
+  assert.equal(report.audit.completeForObservedUrls, false);
+  assert.deepEqual(new Set(Array.from(report.audit.missingUrls, r => r.url)), new Set([source, blob]));
+});
+
 test('media inserted while downloading is reported as not attempted rather than a complete page', async () => {
   let f;
   f = downloadFixture({ [url('/first.gif')]: () => {
@@ -1713,7 +1726,7 @@ test('browser ZIP preserves page order and GIF bytes and corrects misleading ext
   assert.equal(result.archives.length, 1);
   assert.equal(f.saves.length, 1);
   const files = await zipFiles(f.blobs.get(result.archives[0].url));
-  assert.deepEqual([...files.keys()], ['0001.png', '0002.gif', 'download-report.json', 'download-report.csv', 'failed.csv', 'page-audit.json', 'preview.html']);
+  assert.deepEqual([...files.keys()], ['0001.png', '0002.gif', 'download-report.json', 'download-report.csv', 'failed.csv', 'duplicates.csv', 'page-audit.json', 'preview.html']);
   assert.deepEqual(files.get('0002.gif'), gifBytes);
   assert.deepEqual(files.get('0001.png'), pngBytes);
   for (const { options } of f.requests) {
@@ -1745,7 +1758,7 @@ test('console download waits for an already observed Amazon list response before
   const files = await zipFiles(f.blobs.get(report.archives[0].url));
   assert.deepEqual(files.get(original.filename), bytes);
   const json = JSON.parse(files.get('download-report.json'));
-  assert.equal(json.collectorVersion, '2026.10.18.1');
+  assert.equal(json.collectorVersion, '2026.10.18.2');
   assert.equal(json.amazonCollection.thumbnailsWithOriginal, 1);
   assert.deepEqual(json.pendingVideos, []);
 });
@@ -1780,19 +1793,19 @@ test('browser ZIP retains readable blob files and reports unresolved blobs witho
     Buffer.alloc(4), Buffer.from('mp42isom'), Buffer.from([0, 0, 0, 8]), Buffer.from('mdat')]);
   const f = downloadFixture({
     [readable]: new Response(videoBytes), [unresolved]: new TypeError('Failed to fetch'),
-    [unrelated]: new Response(videoBytes)
+    [unrelated]: new Response(Buffer.concat([videoBytes, Buffer.from([1])]))
   });
   for (const src of [readable, unresolved, unrelated]) f.doc.body.append(f.element('video', { attrs: { src } }));
   const report = await f.run().download();
   assert.deepEqual(Array.from(report.results, row => [row.status, row.filename]),
-    [['packed', '0001.mp4'], ['failed', ''], ['packed', '0003.mp4']]);
+    [['packed', '0001.mp4'], ['failed', ''], ['packed', '0002.mp4']]);
   assert.match(report.results[1].message, /임시 blob/);
   assert.match(report.results[1].message, /원본 MP4·HLS 확인/);
   assert.equal(report.results[1].url, unresolved);
   const files = await zipFiles(f.blobs.get(report.archives[0].url));
   assert.deepEqual(files.get('0001.mp4'), videoBytes);
-  assert.deepEqual(files.get('0003.mp4'), videoBytes);
-  assert.ok(!files.has('0002.mp4'));
+  assert.deepEqual(files.get('0002.mp4'), Buffer.concat([videoBytes, Buffer.from([1])]));
+  assert.ok(!files.has('0003.mp4'));
   assert.match(files.get('failed.csv').toString(), /unknown-player/);
 });
 
@@ -1810,7 +1823,7 @@ test('browser ZIP rejects OK, HTML, JSON, HTTP errors and unreadable responses w
   assert.deepEqual(Array.from(result.results, row => row.status), ['failed', 'failed', 'failed', 'failed', 'failed', 'failed', 'packed']);
   assert.equal(result.results[3].httpStatus, 403);
   const files = await zipFiles(f.blobs.get(result.archives[0].url));
-  assert.deepEqual([...files.keys()].filter(name => /^\d/.test(name)), ['0007.gif']);
+  assert.deepEqual([...files.keys()].filter(name => /^\d/.test(name)), ['0001.gif']);
   const report = JSON.parse(files.get('download-report.json'));
   assert.equal(report.results.filter(row => row.status === 'failed').length, 6);
   assert.match(files.get('failed.csv').toString('utf8'), /cors\.jpg/);
@@ -1822,49 +1835,46 @@ test('browser ZIP uses selected visible addresses and retains original order num
   const result = await f.run().download({ visibleOnly: true, start: 2 });
   assert.equal(result.results.length, 1);
   assert.equal(result.results[0].order, 3);
-  assert.equal(result.results[0].filename, '0003.gif');
+  assert.equal(result.results[0].filename, '0001.gif');
+  assert.equal(result.results[0].fileOrder, 1);
   assert.equal(f.requests[0].href, url('/bottom.gif'));
 });
 
-test('browser ZIP splits large batches into independent archives and can retry a save or release URLs', async () => {
+test('browser ZIP keeps one archive even when an old maxZipMB option requests a tiny split', async () => {
   const f = downloadFixture();
   f.doc.body.append(f.img('/one.gif', 100), f.img('/two.gif', 200));
   const grab = f.run(), result = await grab.download({ maxZipMB: gifBytes.length / 1024 ** 2 });
-  assert.equal(result.archives.length, 2);
-  const first = await zipFiles(f.blobs.get(result.archives[0].url));
-  const second = await zipFiles(f.blobs.get(result.archives[1].url));
-  assert.deepEqual([...first.keys()].filter(name => /^\d/.test(name)), ['0001.gif']);
-  assert.deepEqual([...second.keys()].filter(name => /^\d/.test(name)), ['0002.gif']);
-  assert.equal(JSON.parse(first.get('download-report.json')).results.length, 1);
-  grab.saveArchive(2);
-  assert.equal(f.saves.length, 3);
-  assert.equal(f.saves[2].href, result.archives[1].url);
+  assert.equal(result.archives.length, 1);
+  const files = await zipFiles(f.blobs.get(result.archives[0].url));
+  assert.deepEqual([...files.keys()].filter(name => /^\d/.test(name)), ['0001.gif', '0002.gif']);
+  assert.equal(JSON.parse(files.get('download-report.json')).results.length, 2);
+  grab.saveArchive(1);
+  assert.equal(f.saves.length, 2);
+  assert.equal(f.saves[1].href, result.archives[0].url);
   grab.clearDownloads();
   assert.deepEqual(f.revoked, Array.from(result.archives, archive => archive.url));
   assert.equal(grab.lastDownload, null);
 });
 
-test('all split ZIPs contain the same final audit, with global totals and local file reports', async () => {
+test('the single ZIP contains final audit, global totals, coordinates and a separate duplicates report', async () => {
   const f = downloadFixture();
-  f.doc.body.append(f.img('/first.gif', 0), f.img('/second.gif', 100));
-  const report = await f.run().download({ prepare: false, maxZipMB: gifBytes.length / 1024 ** 2 });
-  assert.equal(report.archives.length, 2);
-  for (const [index, archive] of report.archives.entries()) {
-    const files = await zipFiles(f.blobs.get(archive.url));
-    const audit = JSON.parse(files.get('page-audit.json'));
-    const local = JSON.parse(files.get('download-report.json'));
-    assert.deepEqual(audit, JSON.parse(JSON.stringify(report.audit)));
-    assert.equal(audit.finished, true);
-    assert.equal(audit.completeForObservedUrls, true);
-    assert.equal(audit.missingUrls.length, 0);
-    assert.equal(local.session.totalResults, 2);
-    assert.equal(local.session.totalParts, 2);
-    assert.equal(local.session.part, index + 1);
-    assert.equal(local.session.finishedAt, report.finishedAt);
-    assert.equal(local.results.length, 1);
-    assert.ok(files.has(local.results[0].filename));
-    assert.deepEqual(local.audit, audit);
-  }
+  f.doc.body.append(f.img('/first.gif', 0, 20), f.img('/second.gif', 100, 10));
+  const report = await f.run().download({ prepare: false });
+  assert.equal(report.archives.length, 1);
+  const files = await zipFiles(f.blobs.get(report.archives[0].url));
+  const audit = JSON.parse(files.get('page-audit.json'));
+  const local = JSON.parse(files.get('download-report.json'));
+  assert.deepEqual(audit, JSON.parse(JSON.stringify(report.audit)));
+  assert.equal(audit.finished, true);
+  assert.equal(audit.completeForObservedUrls, true);
+  assert.equal(local.session.totalResults, 2);
+  assert.equal(local.session.totalFiles, 2);
+  assert.equal(local.session.totalParts, 1);
+  assert.equal(local.session.finishedAt, report.finishedAt);
+  assert.deepEqual(local.results.map(r => [r.fileOrder, r.x, r.y]), [[1, 20, 0], [2, 10, 100]]);
+  assert.ok(files.has('duplicates.csv'));
+  assert.match(files.get('download-report.csv').toString(), /"fileOrder","order","x","y"/);
+  assert.match(files.get('preview.html').toString(), /x=20, y=0/);
 });
 
 test('failed hidden resources stay failures while visible coverage and blocked-frame scope remain distinct', async () => {
@@ -1982,7 +1992,139 @@ test('explicit playlist option stores stream playlists without claiming a comple
   const result = await f.run().download({ hls: 'playlist' });
   assert.equal(result.results[0].status, 'playlist');
   assert.equal(result.results[0].filename, '0001.m3u8');
-  assert.match(result.results[0].message, /영상 조각/);
+  assert.match(result.results[0].message, /영상 파일/);
 });
 
 
+
+function minimalMp4(suffix = '') {
+  return Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypmp42'), Buffer.alloc(4),
+    Buffer.from('mp42isom'), Buffer.from([0, 0, 0, 8]), Buffer.from('mdat'), Buffer.from(suffix)]);
+}
+
+test('Amazon rendition duplicates read the master once, inherit the first displayed position and share its file number', async () => {
+  const root = 'https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-us-east-1-prod/11111111-1111-1111-1111-111111111111/';
+  const low = root + 'default.jobtemplate.mp4.480.mp4', stream = root + 'default.jobtemplate.hls.m3u8';
+  const f = downloadFixture({ [low]: () => assert.fail('low-resolution duplicate must not be requested'),
+    [stream]: new Response(minimalMp4('best')) });
+  f.doc.body.append(f.img('/first.gif', 10), f.element('video', { attrs: { src: low }, rect: { top: 20, left: 50 } }),
+    f.img('/last.gif', 30), f.element('div', { attrs: { 'data-video-url': stream }, rect: { top: 900, left: 80 } }));
+  const grab = f.run(), report = await grab.download({ prepare: false });
+  const selected = report.results.find(r => r.url === stream), duplicate = report.results.find(r => r.url === low);
+  assert.equal(selected.status, 'packed'); assert.equal(selected.filename, '0002.mp4');
+  assert.deepEqual([selected.x, selected.y], [50, 20]);
+  assert.equal(selected.positionSourceUrl, low);
+  assert.equal(duplicate.status, 'duplicate'); assert.equal(duplicate.filename, selected.filename);
+  assert.equal(duplicate.duplicateOf, stream);
+  assert.equal(f.requests.filter(r => r.href.startsWith(root)).length, 1);
+  assert.equal(report.audit.missingUrls.length, 0);
+  assert.equal(report.audit.duplicateVideoUrls, 1);
+  const files = await zipFiles(f.blobs.get(report.archives[0].url));
+  assert.deepEqual([...files.keys()].filter(n => /^\d/.test(n)), ['0001.gif', '0002.mp4', '0003.gif']);
+  assert.match(files.get('duplicates.csv').toString(), /0002.mp4/);
+});
+
+test('a failed preferred rendition falls back to the same known video and retains the failed attempt', async () => {
+  const root = 'https://m.media-amazon.com/images/S/vse-vms-transcoding-artifact-us-east-1-prod/22222222-2222-2222-2222-222222222222/';
+  const master = root + 'default.jobtemplate.hls.m3u8', low = root + 'default.jobtemplate.mp4.480.mp4';
+  const f = downloadFixture({ [master]: new Response('denied', { status: 403 }), [low]: new Response(minimalMp4('fallback')) });
+  f.doc.body.append(f.element('video', { attrs: { src: low } }), f.element('div', { attrs: { 'data-video-url': master } }));
+  const report = await f.run().download({ prepare: false });
+  const saved = report.results.find(r => r.status === 'packed');
+  assert.equal(saved.url, low);
+  assert.deepEqual(Array.from(saved.attempts, a => a.status), ['failed', 'read']);
+  assert.equal(saved.attempts[0].httpStatus, 403);
+  assert.equal(report.results.find(r => r.url === master).status, 'duplicate');
+  assert.equal(report.audit.missingUrls.length, 0);
+});
+
+test('different URLs with byte-identical video payloads are stored once without guessing an identity', async () => {
+  const a = url('/first.mp4'), b = url('/second.mp4'), bytes = minimalMp4('same');
+  const f = downloadFixture({ [a]: new Response(bytes), [b]: new Response(bytes) });
+  f.doc.body.append(f.element('video', { attrs: { src: a }, rect: { top: 10 } }),
+    f.element('video', { attrs: { src: b }, rect: { top: 20 } }));
+  const report = await f.run().download({ prepare: false });
+  assert.deepEqual(Array.from(report.results, r => r.status), ['packed', 'duplicate']);
+  assert.match(report.results[1].dedupeReason, /전체 바이트 일치/);
+  assert.equal(report.results[1].fileOrder, 1);
+  assert.equal(report.audit.completeForObservedUrls, true);
+  const files = await zipFiles(f.blobs.get(report.archives[0].url));
+  assert.deepEqual([...files.keys()].filter(n => /^\d/.test(n)), ['0001.mp4']);
+});
+
+test('same titles with different Amazon video identities and different bytes remain separate videos', async () => {
+  const a = 'https://cdn.example/a.mp4', b = 'https://cdn.example/b.mp4';
+  const f = downloadFixture({ [a]: new Response(minimalMp4('a')), [b]: new Response(minimalMp4('b')) },
+    { documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  for (const [i, src] of [a, b].entries()) f.doc.body.append(f.element('div', { attrs: {
+    'data-element-id': 'video-carousel-item', 'data-aci-content-id': 'amzn1.vse.video.different' + i,
+    'data-video-url': src, 'data-title': 'Same title' }, rect: { top: i * 100 } }));
+  const report = await f.run().download({ prepare: false });
+  assert.deepEqual(Array.from(report.results, r => r.status), ['packed', 'packed']);
+  assert.equal(report.audit.duplicateVideoUrls, 0);
+});
+
+test('an authoritative Amazon video ID joins actual URLs even when their CDN asset paths differ', async () => {
+  const a = 'https://cdn.example/old.mp4', b = 'https://other-cdn.example/new.mp4';
+  const f = downloadFixture({ [a]: new Response(minimalMp4('one')), [b]: () => assert.fail('same ID alternative') },
+    { documentURL: 'https://www.amazon.com/dp/TEST', baseURI: 'https://www.amazon.com/dp/TEST' });
+  for (const src of [a, b]) f.doc.body.append(f.element('div', { attrs: { 'data-element-id': 'video-carousel-item',
+    'data-aci-content-id': 'amzn1.vse.video.same-identity', 'data-video-url': src } }));
+  const report = await f.run().download({ prepare: false });
+  assert.equal(report.results.filter(r => r.status === 'packed').length, 1);
+  assert.equal(report.results.filter(r => r.status === 'duplicate').length, 1);
+  assert.equal(f.requests.length, 1);
+});
+
+test('deduplicateVideos false retains both original video files for diagnostic comparison', async () => {
+  const a = url('/first.mp4'), b = url('/second.mp4'), bytes = minimalMp4('same');
+  const f = downloadFixture({ [a]: new Response(bytes), [b]: new Response(bytes) });
+  for (const src of [a, b]) f.doc.body.append(f.element('video', { attrs: { src } }));
+  const report = await f.run().download({ prepare: false, deduplicateVideos: false });
+  assert.equal(report.results.filter(r => r.status === 'packed').length, 2);
+  assert.equal(report.audit.duplicateVideoUrls, 0);
+});
+
+test('mixed image, GIF and video files receive one contiguous y-then-x sequence while failed and unplaced URLs stay explicit', async () => {
+  const f = downloadFixture({ [url('/v.mp4')]: new Response(minimalMp4('video')),
+    [url('/denied.jpg')]: new Response('no', { status: 403 }) }, { resources: [{ name: url('/unplaced.gif'), initiatorType: 'img' }] });
+  f.doc.body.append(f.img('/bottom.gif', 200, 0), f.element('video', { attrs: { src: '/v.mp4' }, rect: { top: 100, left: 200 } }),
+    f.img('/left.gif', 100, 100), f.img('/denied.jpg', 0));
+  const report = await f.run().download({ prepare: false });
+  const saved = report.results.filter(r => r.status === 'packed').sort((a, b) => a.fileOrder - b.fileOrder);
+  assert.deepEqual(Array.from(saved, r => [r.fileOrder, r.x, r.y]), [[1, 100, 100], [2, 200, 100], [3, 0, 200], [4, null, null]]);
+  const files = await zipFiles(f.blobs.get(report.archives[0].url));
+  assert.deepEqual([...files.keys()].filter(n => /^\d/.test(n)), ['0001.gif', '0002.mp4', '0003.gif', '0004.gif']);
+  assert.equal(report.results.find(r => r.status === 'failed').fileOrder, null);
+});
+
+test('page number markers use actual saved file numbers and can be removed without altering source media', async () => {
+  const f = downloadFixture(); f.doc.body.append(f.img('/top.gif', 10, 20), f.img('/bottom.gif', 100, 30));
+  const grab = f.run(); await grab.download({ prepare: false });
+  let root;
+  const makeNode = () => ({ style: {}, children: [], setAttribute() {}, appendChild(n) { this.children.push(n); }, remove() { this.removed = true; } });
+  f.doc.createElement = () => makeNode();
+  f.doc.documentElement.appendChild = node => { root = node; };
+  assert.equal(grab.showNumbers().markers, 2);
+  assert.deepEqual(root.children.map(n => n.textContent), ['0001', '0002']);
+  assert.match(root.children[0].style.cssText, /left:20px;top:10px/);
+  grab.hideNumbers(); assert.equal(root.removed, true);
+  assert.deepEqual(visible(grab), [url('/top.gif'), url('/bottom.gif')]);
+});
+
+test('previously observed positions remain labelled as history and CSV follows physical file order', async () => {
+  const f = downloadFixture(), earlier = f.img('/closed-gallery.gif', 50, 20);
+  f.doc.body.append(earlier, f.img('/current.gif', 100, 30));
+  const grab = f.run(); f.doc.body.children.splice(0, 1); grab.scan({ quiet: true });
+  assert.equal(grab.rows.find(r => r.url === url('/closed-gallery.gif')).top, null);
+  const report = await grab.download({ prepare: false });
+  const history = report.results.find(r => r.url === url('/closed-gallery.gif'));
+  assert.equal(history.fileOrder, 1);
+  assert.equal(history.positionBasis, 'last-observed');
+  assert.deepEqual([history.x, history.y], [20, 50]);
+  const files = await zipFiles(f.blobs.get(report.archives[0].url));
+  const csv = files.get('download-report.csv').toString();
+  assert.ok(csv.indexOf('closed-gallery.gif') < csv.indexOf('current.gif'));
+  assert.match(csv, /last-observed/);
+  assert.match(files.get('preview.html').toString(), /마지막 관찰 위치/);
+});
